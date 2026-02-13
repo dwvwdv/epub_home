@@ -25,7 +25,8 @@ class RoomState {
 
   bool get isInRoom => currentRoom != null;
   bool get isHost =>
-      currentRoom?.hostUserId == SupabaseService.currentUserId;
+      currentRoom != null &&
+      currentRoom!.hostUserId == SupabaseService.currentUserId;
   bool get allMembersHaveBook =>
       members.isNotEmpty && members.every((m) => m.hasBook);
 

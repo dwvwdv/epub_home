@@ -6,7 +6,7 @@ import '../models/room_member.dart';
 import 'supabase_service.dart';
 
 class RoomService {
-  final SupabaseClient _client = SupabaseService.client;
+  SupabaseClient get _client => SupabaseService.client;
 
   String _generateRoomCode() {
     final random = Random.secure();

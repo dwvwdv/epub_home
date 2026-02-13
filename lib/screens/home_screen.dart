@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
+import '../config/supabase_config.dart';
 import '../config/theme.dart';
 import '../providers/auth_provider.dart';
 import '../providers/room_provider.dart';
@@ -153,7 +154,17 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
               const Spacer(),
 
               // Auth status
-              if (authState.isAuthenticated)
+              if (!SupabaseConfig.isConfigured)
+                Text(
+                  'Supabase not configured.\n'
+                  'Run with --dart-define=SUPABASE_URL=... --dart-define=SUPABASE_ANON_KEY=...',
+                  style: TextStyle(
+                    color: Colors.white.withValues(alpha: 0.5),
+                    fontSize: 11,
+                  ),
+                  textAlign: TextAlign.center,
+                )
+              else if (authState.isAuthenticated)
                 Text(
                   'Connected',
                   style: TextStyle(
