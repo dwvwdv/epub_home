@@ -111,7 +111,7 @@ class RealtimeService {
     });
   }
 
-  List<Presence> getPresenceState() {
+  List<SinglePresenceState> getPresenceState() {
     if (_channel == null) return [];
     return _channel!.presenceState();
   }
@@ -120,10 +120,7 @@ class RealtimeService {
     final presences = getPresenceState();
     final users = <Map<String, dynamic>>[];
     for (final presence in presences) {
-      final payload = presence.payload;
-      if (payload is Map<String, dynamic>) {
-        users.add(payload);
-      }
+      users.add(presence.payload);
     }
     return users;
   }
