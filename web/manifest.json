@@ -1,0 +1,11 @@
+{
+  "name": "CoTime Book",
+  "short_name": "CoTime Book",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#1A1A2E",
+  "theme_color": "#6C63FF",
+  "description": "Read together, anywhere",
+  "orientation": "portrait-primary",
+  "prefer_related_applications": false
+}

@@ -42,6 +42,7 @@ jobs:
 
       - name: Generate app icons
         run: dart run flutter_launcher_icons
+        continue-on-error: true
 
       - name: Analyze code
         run: flutter analyze --no-fatal-infos
@@ -79,13 +80,21 @@ jobs:
           echo "✓ Keystore configured successfully"
 
       - name: Build APK
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
         run: |
+          DART_DEFINES=""
+          if [ -n "$SUPABASE_URL" ]; then
+            DART_DEFINES="--dart-define=SUPABASE_URL=$SUPABASE_URL --dart-define=SUPABASE_ANON_KEY=$SUPABASE_ANON_KEY"
+          fi
+
           if [ "${{ steps.check_secrets.outputs.has_keystore }}" == "true" ]; then
             echo "Building signed release APK..."
-            flutter build apk --release
+            flutter build apk --release $DART_DEFINES
           else
             echo "Building debug APK..."
-            flutter build apk --debug
+            flutter build apk --debug $DART_DEFINES
           fi
 
       - name: Upload APK artifact

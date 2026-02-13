@@ -1,0 +1,59 @@
+name: cotime_book
+description: CoTime Book - 遠程同步看書工具
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.8.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # State Management
+  flutter_riverpod: ^2.6.1
+  riverpod_annotation: ^2.6.1
+
+  # Backend
+  supabase_flutter: ^2.8.0
+
+  # Routing
+  go_router: ^14.6.0
+
+  # EPUB Reading
+  flutter_epub_viewer: ^1.2.5
+
+  # File handling
+  file_picker: ^8.1.0
+  path_provider: ^2.1.0
+  crypto: ^3.0.6
+
+  # UI
+  gap: ^3.0.1
+
+  # Utilities
+  uuid: ^4.5.1
+  json_annotation: ^4.9.0
+  collection: ^1.19.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+  build_runner: ^2.4.14
+  riverpod_generator: ^2.6.4
+  json_serializable: ^6.9.4
+  flutter_launcher_icons: ^0.14.3
+
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: "assets/icon/app_icon.png"
+  adaptive_icon_background: "#1A1A2E"
+  adaptive_icon_foreground: "assets/icon/app_icon_foreground.png"
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/icon/
