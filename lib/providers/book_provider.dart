@@ -4,6 +4,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../models/book_metadata.dart';
 import '../services/epub_storage_service.dart';
+import '../models/transfer_state.dart';
 import '../services/file_transfer_service.dart';
 import '../services/realtime_service.dart';
 import 'presence_provider.dart';

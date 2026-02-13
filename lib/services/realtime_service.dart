@@ -111,21 +111,18 @@ class RealtimeService {
     });
   }
 
-  Map<String, dynamic> getPresenceState() {
-    if (_channel == null) return {};
+  List<Presence> getPresenceState() {
+    if (_channel == null) return [];
     return _channel!.presenceState();
   }
 
   List<Map<String, dynamic>> getOnlineUsers() {
-    final state = getPresenceState();
+    final presences = getPresenceState();
     final users = <Map<String, dynamic>>[];
-    for (final presences in state.values) {
-      if (presences is List) {
-        for (final p in presences) {
-          if (p is Map<String, dynamic>) {
-            users.add(p);
-          }
-        }
+    for (final presence in presences) {
+      final payload = presence.payload;
+      if (payload is Map<String, dynamic>) {
+        users.add(payload);
       }
     }
     return users;
