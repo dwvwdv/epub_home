@@ -117,10 +117,12 @@ class RealtimeService {
   }
 
   List<Map<String, dynamic>> getOnlineUsers() {
-    final presences = getPresenceState();
+    final state = getPresenceState();
     final users = <Map<String, dynamic>>[];
-    for (final presence in presences) {
-      users.add(presence.payload);
+    for (final singleState in state) {
+      for (final presence in singleState.presences) {
+        users.add(presence.payload);
+      }
     }
     return users;
   }
