@@ -72,11 +72,12 @@ CREATE POLICY "Members can update room reading state"
   );
 
 -- Room members policies
-CREATE POLICY "Room members can read members"
+-- Allow reading members of any active room (since active rooms are public)
+CREATE POLICY "Anyone can read members of active rooms"
   ON room_members FOR SELECT
   USING (
     room_id IN (
-      SELECT room_id FROM room_members WHERE user_id = auth.uid()
+      SELECT id FROM rooms WHERE is_active = true
     )
   );
 

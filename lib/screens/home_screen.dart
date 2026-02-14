@@ -142,10 +142,10 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                 ),
               ],
 
-              if (roomState.error != null) ...[
+              if (roomState.error != null || authState.error != null) ...[
                 const SizedBox(height: 16),
                 Text(
-                  roomState.error!,
+                  roomState.error ?? authState.error!,
                   style: const TextStyle(color: AppTheme.errorColor),
                   textAlign: TextAlign.center,
                 ),
@@ -174,9 +174,18 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                 )
               else
                 TextButton(
-                  onPressed: () =>
-                      ref.read(authProvider.notifier).signInAnonymously(),
-                  child: const Text('Tap to connect'),
+                  onPressed: authState.isLoading
+                      ? null
+                      : () async {
+                          await ref.read(authProvider.notifier).signInAnonymously();
+                        },
+                  child: authState.isLoading
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Text('Tap to connect'),
                 ),
             ],
           ),
