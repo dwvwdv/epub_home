@@ -87,6 +87,23 @@ supabase/
 **Error: "relation 'public.rooms' does not exist"**
 - You need to run the SQL migration file in Supabase (see step 1 above)
 
+**Error: "infinite recursion detected in policy for relation 'room_members'"**
+- This means you ran an old version of the migration file
+- Solution: In Supabase SQL Editor, run:
+  ```sql
+  DROP POLICY IF EXISTS "Room members can read members" ON room_members;
+  ```
+- Then re-run the entire `001_initial_schema.sql` file, or just run:
+  ```sql
+  CREATE POLICY "Anyone can read members of active rooms"
+    ON room_members FOR SELECT
+    USING (
+      room_id IN (
+        SELECT id FROM rooms WHERE is_active = true
+      )
+    );
+  ```
+
 **Error: "Supabase not configured"**
 - Make sure you're running the app with `--dart-define` flags (see step 3 above)
 
