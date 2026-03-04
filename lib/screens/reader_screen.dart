@@ -8,6 +8,7 @@ import '../providers/auth_provider.dart';
 import '../providers/book_provider.dart';
 import '../providers/page_sync_provider.dart';
 import '../providers/presence_provider.dart';
+import '../providers/reading_preferences_provider.dart';
 import '../providers/room_provider.dart';
 import '../widgets/sync_status_bar.dart';
 
@@ -25,26 +26,33 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
   String? _currentCfi;
   bool _isReaderReady = false;
 
+  // Track key so we can rebuild the viewer when theme changes.
+  int _viewerKey = 0;
+
   @override
   void initState() {
     super.initState();
     _epubController = EpubController();
-    WidgetsBinding.instance.addPostFrameCallback((_) => _initSync());
+    // Seed from cached room state immediately so the first build has a CFI.
+    // A fresh DB fetch happens inside _initReader(); if the CFI differs the
+    // viewer is rebuilt via _viewerKey.
+    _currentCfi = ref.read(roomProvider).currentRoom?.currentCfi;
+    WidgetsBinding.instance.addPostFrameCallback((_) => _initReader());
   }
 
-  void _initSync() {
+  Future<void> _initReader() async {
     final authState = ref.read(authProvider);
     final realtimeService = ref.read(realtimeServiceProvider);
 
     if (!authState.isAuthenticated) return;
 
+    // Set page turn callback
     ref.read(pageSyncProvider.notifier).initialize(
           realtimeService: realtimeService,
           currentUserId: authState.userId!,
           currentNickname: authState.nickname,
         );
 
-    // Set page turn callback
     ref.read(pageSyncProvider.notifier).onPageTurn = (direction) {
       if (_epubController != null && _isReaderReady) {
         if (direction == PageTurnDirection.next) {
@@ -55,11 +63,20 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
       }
     };
 
-    // Load initial CFI position
-    final room = ref.read(roomProvider).currentRoom;
-    if (room?.currentCfi != null) {
-      _currentCfi = room!.currentCfi;
+    // Fetch the latest room CFI from DB (in case other users advanced the page
+    // while this user was away).  If it differs from cached, force viewer reload.
+    await ref.read(roomProvider.notifier).refreshRoom();
+    final freshRoom = ref.read(roomProvider).currentRoom;
+    final freshCfi = freshRoom?.currentCfi;
+    if (freshCfi != null && freshCfi != _currentCfi) {
+      setState(() {
+        _currentCfi = freshCfi;
+        _viewerKey++; // rebuild EpubViewer with the updated initialCfi
+      });
     }
+
+    // Mark this user as currently reading in presence.
+    await ref.read(presenceProvider.notifier).updateIsReading(true);
   }
 
   @override
@@ -73,91 +90,99 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
     final syncState = ref.watch(pageSyncProvider);
     final presenceState = ref.watch(presenceProvider);
     final bookState = ref.watch(bookProvider);
+    final prefs = ref.watch(readingPreferencesProvider);
 
     if (bookState.bookFile == null) {
       return Scaffold(
         appBar: AppBar(title: const Text('Reader')),
-        body: const Center(
-          child: Text('No book loaded'),
-        ),
+        body: const Center(child: Text('No book loaded')),
       );
     }
 
-    return Scaffold(
-      body: SafeArea(
-        child: Column(
-          children: [
-            // Sync status bar
-            SyncStatusBar(
-              syncState: syncState,
-              onlineUsers: presenceState.onlineUsers,
-              onConfirm: () =>
-                  ref.read(pageSyncProvider.notifier).confirmPageTurn(),
-              onDecline: () =>
-                  ref.read(pageSyncProvider.notifier).declinePageTurn(),
-            ),
-
-            // EPUB reader with gesture overlay
-            Expanded(
-              child: Stack(
-                children: [
-                  // Layer 1: EPUB viewer
-                  EpubViewer(
-                    epubController: _epubController!,
-                    epubSource: EpubSource.fromFile(bookState.bookFile!),
-                    displaySettings: EpubDisplaySettings(
-                      flow: EpubFlow.paginated,
-                      snap: true,
-                    ),
-                    initialCfi: _currentCfi,
-                    onChaptersLoaded: (chapters) {
-                      setState(() => _isReaderReady = true);
-                    },
-                    onRelocated: (location) {
-                      _currentCfi = location.startCfi;
-                      ref.read(bookProvider.notifier).updateCfi(location.startCfi);
-                      ref
-                          .read(roomProvider.notifier)
-                          .updateCfi(location.startCfi);
-                    },
-                  ),
-
-                  // Layer 2: Gesture interceptor overlay
-                  if (_isReaderReady)
-                    Positioned.fill(
-                      child: GestureDetector(
-                        behavior: HitTestBehavior.translucent,
-                        onHorizontalDragEnd: (details) {
-                          if (syncState.status != SyncStatus.idle) return;
-                          if (details.primaryVelocity == null) return;
-
-                          if (details.primaryVelocity! < -200) {
-                            // Swipe left = next page
-                            ref
-                                .read(pageSyncProvider.notifier)
-                                .requestPageTurn(
-                                  direction: PageTurnDirection.next,
-                                  fromCfi: _currentCfi,
-                                );
-                          } else if (details.primaryVelocity! > 200) {
-                            // Swipe right = previous page
-                            ref
-                                .read(pageSyncProvider.notifier)
-                                .requestPageTurn(
-                                  direction: PageTurnDirection.previous,
-                                  fromCfi: _currentCfi,
-                                );
-                          }
-                        },
-                      ),
-                    ),
-                ],
+    // Feature 2: intercept hardware back button in reader → go back to lobby.
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) _leaveReader();
+      },
+      child: Scaffold(
+        backgroundColor: prefs.backgroundColor,
+        body: SafeArea(
+          child: Column(
+            children: [
+              // Sync status bar
+              SyncStatusBar(
+                syncState: syncState,
+                onlineUsers: presenceState.onlineUsers,
+                onConfirm: () =>
+                    ref.read(pageSyncProvider.notifier).confirmPageTurn(),
+                onDecline: () =>
+                    ref.read(pageSyncProvider.notifier).declinePageTurn(),
               ),
-            ),
 
-            // Bottom navigation bar
-            _buildBottomBar(syncState),
-          ],
+              // EPUB reader with gesture overlay
+              Expanded(
+                child: Stack(
+                  children: [
+                    // Layer 1: EPUB viewer
+                    EpubViewer(
+                      key: ValueKey(_viewerKey),
+                      epubController: _epubController!,
+                      epubSource: EpubSource.fromFile(bookState.bookFile!),
+                      displaySettings: EpubDisplaySettings(
+                        flow: EpubFlow.paginated,
+                        snap: true,
+                      ),
+                      initialCfi: _currentCfi,
+                      onChaptersLoaded: (chapters) {
+                        setState(() => _isReaderReady = true);
+                      },
+                      onRelocated: (location) {
+                        _currentCfi = location.startCfi;
+                        ref
+                            .read(bookProvider.notifier)
+                            .updateCfi(location.startCfi);
+                        ref
+                            .read(roomProvider.notifier)
+                            .updateCfi(location.startCfi);
+                      },
+                    ),
+
+                    // Layer 2: Gesture interceptor overlay
+                    if (_isReaderReady)
+                      Positioned.fill(
+                        child: GestureDetector(
+                          behavior: HitTestBehavior.translucent,
+                          onHorizontalDragEnd: (details) {
+                            if (syncState.status != SyncStatus.idle) return;
+                            if (details.primaryVelocity == null) return;
+
+                            if (details.primaryVelocity! < -200) {
+                              ref
+                                  .read(pageSyncProvider.notifier)
+                                  .requestPageTurn(
+                                    direction: PageTurnDirection.next,
+                                    fromCfi: _currentCfi,
+                                  );
+                            } else if (details.primaryVelocity! > 200) {
+                              ref
+                                  .read(pageSyncProvider.notifier)
+                                  .requestPageTurn(
+                                    direction: PageTurnDirection.previous,
+                                    fromCfi: _currentCfi,
+                                  );
+                            }
+                          },
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+
+              // Bottom navigation bar
+              _buildBottomBar(syncState),
+            ],
+          ),
         ),
       ),
     );
@@ -206,10 +231,17 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
 
           const Spacer(),
 
+          // Theme / color settings button (Feature 1)
+          IconButton(
+            icon: const Icon(Icons.palette_outlined),
+            onPressed: _showThemeSettings,
+            tooltip: 'Reading theme',
+          ),
+
           // Members indicator
           IconButton(
             icon: const Icon(Icons.people_outline),
-            onPressed: () => _showMembersDrawer(),
+            onPressed: _showMembersDrawer,
             tooltip: 'Room members',
           ),
         ],
@@ -217,6 +249,81 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
     );
   }
 
+  // Feature 1: Show reading theme settings panel.
+  void _showThemeSettings() {
+    final prefs = ref.read(readingPreferencesProvider);
+
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: AppTheme.surfaceColor,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) => Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Reading Theme',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 16),
+
+            // Theme presets row
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+              children: [
+                _ThemeOption(
+                  label: 'Day',
+                  bgColor: Colors.white,
+                  textColor: Colors.black87,
+                  isSelected: prefs.theme == ReadingTheme.day,
+                  onTap: () {
+                    ref
+                        .read(readingPreferencesProvider.notifier)
+                        .setTheme(ReadingTheme.day);
+                    setState(() => _viewerKey++);
+                    Navigator.pop(ctx);
+                  },
+                ),
+                _ThemeOption(
+                  label: 'Sepia',
+                  bgColor: const Color(0xFFF5E6C8),
+                  textColor: const Color(0xFF4A3728),
+                  isSelected: prefs.theme == ReadingTheme.sepia,
+                  onTap: () {
+                    ref
+                        .read(readingPreferencesProvider.notifier)
+                        .setTheme(ReadingTheme.sepia);
+                    setState(() => _viewerKey++);
+                    Navigator.pop(ctx);
+                  },
+                ),
+                _ThemeOption(
+                  label: 'Night',
+                  bgColor: const Color(0xFF1A1A2E),
+                  textColor: const Color(0xFFE0E0E0),
+                  isSelected: prefs.theme == ReadingTheme.night,
+                  onTap: () {
+                    ref
+                        .read(readingPreferencesProvider.notifier)
+                        .setTheme(ReadingTheme.night);
+                    setState(() => _viewerKey++);
+                    Navigator.pop(ctx);
+                  },
+                ),
+              ],
+            ),
+            const SizedBox(height: 20),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // Feature 3: Members panel showing who's reading and who left (yellow).
   void _showMembersDrawer() {
     final presenceState = ref.read(presenceProvider);
     showModalBottomSheet(
@@ -232,33 +339,48 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text(
-              '${presenceState.onlineCount} Readers Online',
+              '${presenceState.onlineCount} Members Online',
               style: const TextStyle(
                 fontSize: 18,
                 fontWeight: FontWeight.bold,
               ),
             ),
             const SizedBox(height: 16),
-            ...presenceState.onlineUsers.map((user) => Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 4),
-                  child: Row(
-                    children: [
-                      Container(
-                        width: 8,
-                        height: 8,
-                        decoration: const BoxDecoration(
-                          color: Colors.green,
-                          shape: BoxShape.circle,
+            ...presenceState.onlineUsers.map((user) {
+              final isReading = user['is_reading'] as bool? ?? false;
+              final nickname = user['nickname'] as String? ?? 'Unknown';
+              return Padding(
+                padding: const EdgeInsets.symmetric(vertical: 4),
+                child: Row(
+                  children: [
+                    Container(
+                      width: 10,
+                      height: 10,
+                      decoration: BoxDecoration(
+                        // Green = reading, Yellow = left the page
+                        color: isReading ? Colors.green : Colors.amber,
+                        shape: BoxShape.circle,
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Text(
+                        nickname,
+                        style: TextStyle(
+                          fontSize: 16,
+                          color: isReading ? Colors.white : Colors.amber,
                         ),
                       ),
-                      const SizedBox(width: 12),
-                      Text(
-                        user['nickname'] as String? ?? 'Unknown',
-                        style: const TextStyle(fontSize: 16),
+                    ),
+                    if (!isReading)
+                      const Text(
+                        'Left',
+                        style: TextStyle(color: Colors.amber, fontSize: 12),
                       ),
-                    ],
-                  ),
-                )),
+                  ],
+                ),
+              );
+            }),
             const SizedBox(height: 20),
           ],
         ),
@@ -266,7 +388,69 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
     );
   }
 
-  void _leaveReader() {
-    context.goNamed('lobby', pathParameters: {'roomCode': widget.roomCode});
+  Future<void> _leaveReader() async {
+    // Feature 3: Mark this user as no longer reading.
+    await ref.read(presenceProvider.notifier).updateIsReading(false);
+    if (mounted) {
+      context.goNamed('lobby', pathParameters: {'roomCode': widget.roomCode});
+    }
+  }
+}
+
+/// A circular theme-selection button shown in the theme picker.
+class _ThemeOption extends StatelessWidget {
+  final String label;
+  final Color bgColor;
+  final Color textColor;
+  final bool isSelected;
+  final VoidCallback onTap;
+
+  const _ThemeOption({
+    required this.label,
+    required this.bgColor,
+    required this.textColor,
+    required this.isSelected,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Column(
+        children: [
+          Container(
+            width: 72,
+            height: 72,
+            decoration: BoxDecoration(
+              color: bgColor,
+              shape: BoxShape.circle,
+              border: Border.all(
+                color: isSelected ? AppTheme.primaryColor : Colors.white24,
+                width: isSelected ? 3 : 1,
+              ),
+            ),
+            child: Center(
+              child: Text(
+                'Aa',
+                style: TextStyle(
+                  color: textColor,
+                  fontWeight: FontWeight.bold,
+                  fontSize: 18,
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            label,
+            style: TextStyle(
+              color: isSelected ? AppTheme.primaryColor : Colors.white70,
+              fontSize: 12,
+            ),
+          ),
+        ],
+      ),
+    );
   }
 }

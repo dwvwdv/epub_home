@@ -30,6 +30,7 @@ class RealtimeService {
     required String nickname,
     required int avatarColorIndex,
     required bool hasBook,
+    bool isReading = false,
   }) {
     final channelName = AppConstants.roomChannelName(roomCode);
     _channel = SupabaseService.client.channel(
@@ -61,6 +62,7 @@ class RealtimeService {
       'book_chunk',
       'transfer_request',
       'transfer_accept',
+      'start_reading',
     ];
 
     for (final event in events) {
@@ -76,6 +78,7 @@ class RealtimeService {
           'nickname': nickname,
           'avatar_color': avatarColorIndex,
           'has_book': hasBook,
+          'is_reading': isReading,
           'online_at': DateTime.now().toIso8601String(),
         });
         debugPrint('Joined room channel: $channelName');
@@ -100,6 +103,7 @@ class RealtimeService {
     required String nickname,
     required int avatarColorIndex,
     required bool hasBook,
+    bool isReading = false,
   }) async {
     if (_channel == null) return;
     await _channel!.track({
@@ -107,6 +111,7 @@ class RealtimeService {
       'nickname': nickname,
       'avatar_color': avatarColorIndex,
       'has_book': hasBook,
+      'is_reading': isReading,
       'online_at': DateTime.now().toIso8601String(),
     });
   }

@@ -50,6 +50,8 @@ class PresenceNotifier extends StateNotifier<PresenceState> {
   String? _currentUserId;
   String? _currentNickname;
   int _currentAvatarColorIndex = 0;
+  bool _currentHasBook = false;
+  bool _currentIsReading = false;
 
   PresenceNotifier(this._realtimeService) : super(const PresenceState());
 
@@ -59,10 +61,13 @@ class PresenceNotifier extends StateNotifier<PresenceState> {
     required String nickname,
     required int avatarColorIndex,
     bool hasBook = false,
+    bool isReading = false,
   }) {
     _currentUserId = userId;
     _currentNickname = nickname;
     _currentAvatarColorIndex = avatarColorIndex;
+    _currentHasBook = hasBook;
+    _currentIsReading = isReading;
 
     _realtimeService.joinRoom(
       roomCode: roomCode,
@@ -70,6 +75,7 @@ class PresenceNotifier extends StateNotifier<PresenceState> {
       nickname: nickname,
       avatarColorIndex: avatarColorIndex,
       hasBook: hasBook,
+      isReading: isReading,
     );
 
     _subscription?.cancel();
@@ -86,11 +92,25 @@ class PresenceNotifier extends StateNotifier<PresenceState> {
 
   Future<void> updateHasBook(bool hasBook) async {
     if (_currentUserId == null) return;
+    _currentHasBook = hasBook;
     await _realtimeService.updatePresence(
       userId: _currentUserId!,
       nickname: _currentNickname ?? '',
       avatarColorIndex: _currentAvatarColorIndex,
       hasBook: hasBook,
+      isReading: _currentIsReading,
+    );
+  }
+
+  Future<void> updateIsReading(bool isReading) async {
+    if (_currentUserId == null) return;
+    _currentIsReading = isReading;
+    await _realtimeService.updatePresence(
+      userId: _currentUserId!,
+      nickname: _currentNickname ?? '',
+      avatarColorIndex: _currentAvatarColorIndex,
+      hasBook: _currentHasBook,
+      isReading: isReading,
     );
   }
 
@@ -100,6 +120,8 @@ class PresenceNotifier extends StateNotifier<PresenceState> {
     _currentUserId = null;
     _currentNickname = null;
     _currentAvatarColorIndex = 0;
+    _currentHasBook = false;
+    _currentIsReading = false;
     await _realtimeService.leaveRoom();
     state = const PresenceState();
   }

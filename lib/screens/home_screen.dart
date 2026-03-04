@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import '../config/supabase_config.dart';
@@ -19,6 +20,9 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   final _roomCodeController = TextEditingController();
   bool _isJoinMode = false;
 
+  // Feature 2: track last back-press time for double-back-to-exit.
+  DateTime? _lastBackPress;
+
   @override
   void dispose() {
     _nicknameController.dispose();
@@ -31,7 +35,26 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     final authState = ref.watch(authProvider);
     final roomState = ref.watch(roomProvider);
 
-    return Scaffold(
+    // Feature 2: intercept hardware back on home screen → double-back to exit.
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) {
+        if (didPop) return;
+        final now = DateTime.now();
+        if (_lastBackPress == null ||
+            now.difference(_lastBackPress!) > const Duration(seconds: 2)) {
+          _lastBackPress = now;
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Press back again to exit'),
+              duration: Duration(seconds: 2),
+            ),
+          );
+        } else {
+          SystemNavigator.pop();
+        }
+      },
+      child: Scaffold(
       body: SafeArea(
         child: Padding(
           padding: const EdgeInsets.all(24),
@@ -191,7 +214,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           ),
         ),
       ),
-    );
+    ),   // end Scaffold
+    );   // end PopScope
   }
 
   String? _validateNickname() {
