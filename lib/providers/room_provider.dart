@@ -78,6 +78,7 @@ class RoomNotifier extends StateNotifier<RoomState> {
   bool _heartbeatInFlight = false;
   bool _appIsActive = true;
   bool _revocationInProgress = false;
+  int _roomSessionGeneration = 0;
 
   RoomNotifier(
     this._roomService, {
@@ -108,6 +109,7 @@ class RoomNotifier extends StateNotifier<RoomState> {
     try {
       final room = await _roomService.createRoom(nickname: nickname);
       final members = await _roomService.getRoomMembers(room.id);
+      _roomSessionGeneration++;
       state = state.copyWith(
         currentRoom: room,
         members: members,
@@ -130,6 +132,7 @@ class RoomNotifier extends StateNotifier<RoomState> {
         nickname: nickname,
       );
       final members = await _roomService.getRoomMembers(room.id);
+      _roomSessionGeneration++;
       state = state.copyWith(
         currentRoom: room,
         members: members,
@@ -262,9 +265,11 @@ class RoomNotifier extends StateNotifier<RoomState> {
     required String roomId,
     required String cfi,
   }) async {
-    if (state.currentRoom?.id != roomId) {
+    if (state.currentRoom?.id != roomId || state.isLoading) {
       throw RoomSessionChangedException(roomId);
     }
+    final roomSessionGeneration = _roomSessionGeneration;
+    final readingSessionId = state.readingSessionId;
 
     final Room updatedRoom;
     try {
@@ -276,7 +281,11 @@ class RoomNotifier extends StateNotifier<RoomState> {
       await _revokeSession(roomId, error.message);
       rethrow;
     }
-    if (state.currentRoom?.id != roomId) return;
+    if (_roomSessionGeneration != roomSessionGeneration ||
+        state.currentRoom?.id != roomId ||
+        state.readingSessionId != readingSessionId) {
+      throw RoomSessionChangedException(roomId);
+    }
     state = state.copyWith(currentRoom: updatedRoom, error: null);
   }
 
@@ -346,6 +355,7 @@ class RoomNotifier extends StateNotifier<RoomState> {
   Future<void> _revokeSession(String roomId, String reason) async {
     if (_revocationInProgress || state.currentRoom?.id != roomId) return;
     _revocationInProgress = true;
+    _roomSessionGeneration++;
     _heartbeatTimer?.cancel();
     _heartbeatTimer = null;
     state = RoomState(error: reason);
@@ -361,6 +371,7 @@ class RoomNotifier extends StateNotifier<RoomState> {
 
   Future<void> leaveRoom() async {
     final room = state.currentRoom;
+    _roomSessionGeneration++;
     if (room == null) {
       _heartbeatTimer?.cancel();
       _heartbeatTimer = null;

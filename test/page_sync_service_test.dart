@@ -177,9 +177,11 @@ void main() {
         const targetCfi = 'epubcfi(/6/6)';
         service.updateReaderContext(isReady: true, currentCfi: targetCfi);
         final committed = await service.commitPagePosition(targetCfi);
+        final acknowledged = await service.acknowledgePagePosition(targetCfi);
         await flushEvents();
 
         expect(committed, isTrue);
+        expect(acknowledged, isTrue);
         expect(turns, 1);
         expect(commits, 1);
         expect(service.currentState.status, SyncStatus.idle);
@@ -369,6 +371,7 @@ void main() {
         const targetCfi = 'epubcfi(/6/8)';
         service.updateReaderContext(isReady: true, currentCfi: targetCfi);
         expect(await service.commitPagePosition(targetCfi), isTrue);
+        expect(await service.acknowledgePagePosition(targetCfi), isTrue);
         await flushEvents();
 
         expect(service.currentState.status, SyncStatus.turning);
@@ -448,6 +451,60 @@ void main() {
           ),
           hasLength(1),
         );
+      },
+    );
+
+    test(
+      'reader reconnect rejoins the roster for later page turns',
+      () async {
+        final transport = FakePageSyncTransport()
+          ..onlineUsers = [readyUser('user-a'), readyUser('user-b')];
+        final service = createService(transport, currentCfi: cfi);
+        addTearDown(() async {
+          await service.dispose();
+          await transport.dispose();
+        });
+
+        await service.requestPageTurn(
+          direction: PageTurnDirection.next,
+          fromCfi: cfi,
+        );
+        final requestId = service.currentState.currentRequest!.requestId;
+        transport.emit('page_turn_confirm', {
+          'request_id': requestId,
+          'user_id': 'user-b',
+        });
+        await flushEvents();
+
+        const targetCfi = 'epubcfi(/6/13)';
+        service.updateReaderContext(isReady: true, currentCfi: targetCfi);
+        expect(await service.commitPagePosition(targetCfi), isTrue);
+        expect(await service.acknowledgePagePosition(targetCfi), isTrue);
+
+        transport.onlineUsers = [readyUser('user-a')];
+        transport.emitPresence({'event': 'leave'});
+        await flushEvents();
+        expect(service.currentState.status, SyncStatus.idle);
+
+        transport.onlineUsers = [
+          readyUser('user-a'),
+          {
+            'user_id': 'user-b',
+            'is_reading': true,
+            'reader_ready': false,
+          },
+        ];
+        transport.emitPresence({'event': 'sync'});
+        await flushEvents();
+
+        expect(
+          await service.requestPageTurn(
+            direction: PageTurnDirection.next,
+            fromCfi: targetCfi,
+          ),
+          isFalse,
+        );
+        expect(service.currentState.errorMessage, contains('become ready'));
       },
     );
 
@@ -625,6 +682,7 @@ void main() {
         const targetCfi = 'epubcfi(/6/12)';
         service.updateReaderContext(isReady: true, currentCfi: targetCfi);
         expect(await service.commitPagePosition(targetCfi), isTrue);
+        expect(await service.acknowledgePagePosition(targetCfi), isTrue);
         await flushEvents();
         transport.failingEvents.add('page_turn_complete');
         transport.emit('page_position_ack', {

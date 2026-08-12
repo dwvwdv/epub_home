@@ -55,6 +55,7 @@ class PageSyncService {
   final String _currentUserId;
   final String _currentNickname;
   final String _readingSessionId;
+  final Set<String> _sessionParticipantUserIds;
   final Set<String> _expectedParticipantUserIds;
   final Uuid _uuid;
   final Duration _requestTimeout;
@@ -70,6 +71,7 @@ class PageSyncService {
   final Set<String> _completeInFlightIds = {};
   final Set<String> _seenRequestIds = {};
   final Set<String> _enteredReaderParticipantIds = {};
+  final Set<String> _explicitlyLeftParticipantUserIds = {};
 
   Timer? _timeoutTimer;
   PageSyncState _state = const PageSyncState.idle();
@@ -97,6 +99,10 @@ class PageSyncService {
        _currentUserId = currentUserId,
        _currentNickname = currentNickname,
        _readingSessionId = readingSessionId,
+       _sessionParticipantUserIds = {
+         ...expectedParticipantUserIds,
+         currentUserId,
+       },
        _expectedParticipantUserIds = Set.of(expectedParticipantUserIds)
          ..add(currentUserId),
        _uuid = uuid,
@@ -747,9 +753,11 @@ class PageSyncService {
   void _onReadingSessionLeave(Map<String, dynamic> payload) {
     if (_disposed || payload['session_id'] != _readingSessionId) return;
     final userId = payload['user_id'];
-    if (userId is! String || !_expectedParticipantUserIds.remove(userId)) {
+    if (userId is! String || !_sessionParticipantUserIds.contains(userId)) {
       return;
     }
+    _explicitlyLeftParticipantUserIds.add(userId);
+    _expectedParticipantUserIds.remove(userId);
     _enteredReaderParticipantIds.remove(userId);
 
     final current = _state.currentRequest;
@@ -903,9 +911,15 @@ class PageSyncService {
     for (final user in users) {
       final userId = user['user_id'];
       if (userId is String &&
-          _expectedParticipantUserIds.contains(userId) &&
+          _sessionParticipantUserIds.contains(userId) &&
+          !_explicitlyLeftParticipantUserIds.contains(userId) &&
           user['is_reading'] == true) {
         _enteredReaderParticipantIds.add(userId);
+        // A temporary Presence disconnect removes an entered reader from the
+        // active roster so the in-flight turn can finish. Re-add that reader
+        // after reconnection; otherwise clients permanently disagree about the
+        // quorum for every later page turn in the same reading session.
+        _expectedParticipantUserIds.add(userId);
       }
     }
   }

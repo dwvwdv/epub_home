@@ -117,6 +117,8 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
     unawaited(() async {
       try {
         await pageSync.leaveReadingSession();
+      } catch (_) {
+        // Route disposal cannot surface an unhandled Realtime send failure.
       } finally {
         await pageSync.stop();
       }
@@ -232,7 +234,13 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
           await roomNotifier
               .updateCfiForRoom(roomId: roomId, cfi: targetCfi)
               .timeout(const Duration(seconds: 10));
-          if (!mounted || _isStoppingPageSync) return;
+          if (!mounted ||
+              _isStoppingPageSync ||
+              !ref
+                  .read(pageSyncProvider.notifier)
+                  .isRequestActive(command.requestId)) {
+            return;
+          }
           final pageSync = ref.read(pageSyncProvider.notifier);
           final committed = await pageSync.commitPagePosition(targetCfi);
           if (committed) {
@@ -452,7 +460,7 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
           // Leave button
           IconButton(
             icon: const Icon(Icons.arrow_back),
-            onPressed: _leaveReader,
+            onPressed: syncState.currentRequest == null ? _leaveReader : null,
             tooltip: 'Leave reading',
           ),
 
@@ -667,6 +675,10 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
   Future<void> _leaveReader() async {
     // Feature 3: Mark this user as no longer reading.
     if (_isStoppingPageSync) return;
+    if (ref.read(pageSyncProvider).currentRequest != null) {
+      _showSyncError('Wait for the current synchronized page turn to finish.');
+      return;
+    }
     _isStoppingPageSync = true;
     final pageSync = ref.read(pageSyncProvider.notifier);
     pageSync.updateReaderContext(isReady: false, currentCfi: _currentCfi);
@@ -690,6 +702,13 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
     if (mounted) {
       context.goNamed('lobby', pathParameters: {'roomCode': widget.roomCode});
     }
+  }
+
+  void _showSyncError(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
   }
 }
 

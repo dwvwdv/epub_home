@@ -91,7 +91,10 @@ void main() {
       delayedWrite.complete(
         roomA.copyWith(currentCfi: 'epubcfi(/6/8)'),
       );
-      await write;
+      await expectLater(
+        write,
+        throwsA(isA<RoomSessionChangedException>()),
+      );
 
       expect(notifier.state.currentRoom?.id, 'room-b');
       expect(notifier.state.currentRoom?.currentCfi, isNull);
@@ -102,6 +105,33 @@ void main() {
         ),
         throwsA(isA<RoomSessionChangedException>()),
       );
+    });
+
+    test('a delayed CFI write cannot cross a same-room rejoin', () async {
+      final service = FakeRoomService();
+      final notifier = RoomNotifier(service);
+      addTearDown(notifier.dispose);
+
+      final room = await notifier.createRoom('Alice');
+      final delayedWrite = Completer<Room>();
+      service.cfiWrite = delayedWrite;
+      final write = notifier.updateCfiForRoom(
+        roomId: room!.id,
+        cfi: 'epubcfi(/6/14)',
+      );
+      await Future<void>.delayed(Duration.zero);
+
+      await notifier.leaveRoom();
+      service.nextRoom = testRoom(id: room.id, code: room.code);
+      await notifier.joinRoom(room.code, 'Alice');
+      delayedWrite.complete(room.copyWith(currentCfi: 'epubcfi(/6/14)'));
+
+      await expectLater(
+        write,
+        throwsA(isA<RoomSessionChangedException>()),
+      );
+      expect(notifier.state.currentRoom?.id, room.id);
+      expect(notifier.state.currentRoom?.currentCfi, isNull);
     });
   });
 }
