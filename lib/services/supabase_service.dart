@@ -2,6 +2,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import '../config/supabase_config.dart';
 
 class SupabaseService {
+  static const String schemaName = 'cotime_book';
   static bool _initialized = false;
 
   static bool get isInitialized => _initialized;
@@ -15,6 +16,9 @@ class SupabaseService {
     }
     return Supabase.instance.client;
   }
+
+  /// Database client scoped to this app's dedicated schema.
+  static SupabaseQuerySchema get database => client.schema(schemaName);
 
   static Future<void> initialize() async {
     if (!SupabaseConfig.isConfigured) {

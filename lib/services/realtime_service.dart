@@ -35,7 +35,7 @@ class RealtimeService {
     final channelName = AppConstants.roomChannelName(roomCode);
     _channel = SupabaseService.client.channel(
       channelName,
-      opts: const RealtimeChannelConfig(self: true),
+      opts: const RealtimeChannelConfig(self: true, private: true),
     );
 
     // Set up presence tracking

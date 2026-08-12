@@ -13,5 +13,5 @@ class AppConstants {
   static const Duration chunkDelay = Duration(milliseconds: 100);
 
   // Realtime
-  static String roomChannelName(String roomCode) => 'room:$roomCode';
+  static String roomChannelName(String roomCode) => 'cotime_book:room:$roomCode';
 }
