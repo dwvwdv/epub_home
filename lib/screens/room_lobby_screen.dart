@@ -530,18 +530,11 @@ class _RoomLobbyScreenState extends ConsumerState<RoomLobbyScreen> {
       return false;
     }
 
-    final onlineById = {
-      for (final user in presenceState.onlineUsers)
-        if (user['user_id'] is String) user['user_id'] as String: user,
-    };
-    return roomState.members.every((member) {
-      final presence = onlineById[member.userId];
-      final readyHashes = presence?['ready_book_hashes'];
-      return presence != null &&
-          presence['has_book'] == true &&
-          readyHashes is List &&
-          readyHashes.contains(currentBookHash);
-    });
+    return hasExactReadyBookRoster(
+      memberUserIds: roomState.members.map((member) => member.userId),
+      onlineUsers: presenceState.onlineUsers,
+      currentBookHash: currentBookHash,
+    );
   }
 
   Widget _buildRouteError(String message) {
@@ -612,4 +605,31 @@ class _RoomLobbyScreenState extends ConsumerState<RoomLobbyScreen> {
       context,
     ).showSnackBar(SnackBar(content: Text(message)));
   }
+}
+
+/// Fail closed while a membership refresh is catching up with Presence. Every
+/// online logical user must be a DB room member, and every DB member must be
+/// online with the exact shared book before the host can freeze the roster.
+bool hasExactReadyBookRoster({
+  required Iterable<String> memberUserIds,
+  required Iterable<Map<String, dynamic>> onlineUsers,
+  required String currentBookHash,
+}) {
+  final memberIds = memberUserIds.toSet();
+  final onlineById = {
+    for (final user in onlineUsers)
+      if (user['user_id'] is String) user['user_id'] as String: user,
+  };
+  if (memberIds.length != onlineById.length ||
+      !memberIds.every(onlineById.containsKey)) {
+    return false;
+  }
+
+  return memberIds.every((userId) {
+    final presence = onlineById[userId]!;
+    final readyHashes = presence['ready_book_hashes'];
+    return presence['has_book'] == true &&
+        readyHashes is List &&
+        readyHashes.contains(currentBookHash);
+  });
 }
