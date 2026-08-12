@@ -18,6 +18,9 @@ class SyncStatusBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    if (syncState.errorMessage != null) {
+      return _buildErrorBar(syncState.errorMessage!);
+    }
     switch (syncState.status) {
       case SyncStatus.idle:
         return _buildIdleBar();
@@ -33,6 +36,15 @@ class SyncStatusBar extends StatelessWidget {
   }
 
   Widget _buildIdleBar() {
+    final readyReaderCount = onlineUsers
+        .where(
+          (user) =>
+              user['is_reading'] == true && user['reader_ready'] == true,
+        )
+        .map((user) => user['user_id'])
+        .whereType<String>()
+        .toSet()
+        .length;
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
       color: AppTheme.surfaceColor,
@@ -41,7 +53,7 @@ class SyncStatusBar extends StatelessWidget {
           const Icon(Icons.people, size: 16, color: Colors.white54),
           const SizedBox(width: 8),
           Text(
-            '${onlineUsers.length} readers online',
+            '$readyReaderCount readers ready',
             style: const TextStyle(color: Colors.white54, fontSize: 13),
           ),
           const Spacer(),
@@ -57,6 +69,26 @@ class SyncStatusBar extends StatelessWidget {
           const Text(
             'Synced',
             style: TextStyle(color: Colors.green, fontSize: 13),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildErrorBar(String message) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      color: AppTheme.errorColor.withValues(alpha: 0.18),
+      child: Row(
+        children: [
+          const Icon(Icons.sync_problem, size: 18, color: AppTheme.errorColor),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              message,
+              style: const TextStyle(color: AppTheme.errorColor, fontSize: 13),
+              overflow: TextOverflow.ellipsis,
+            ),
           ),
         ],
       ),
@@ -89,7 +121,7 @@ class SyncStatusBar extends StatelessWidget {
             ),
           ),
           Text(
-            '${request.confirmedUserIds.length}/${request.requiredUserIds.length}',
+            '${request.validConfirmationCount}/${request.requiredUserIds.length}',
             style: const TextStyle(
               color: Colors.white70,
               fontWeight: FontWeight.bold,
@@ -163,7 +195,7 @@ class SyncStatusBar extends StatelessWidget {
           Expanded(
             child: Text(
               'Waiting for others to confirm... '
-              '${request.confirmedUserIds.length}/${request.requiredUserIds.length}',
+              '${request.validConfirmationCount}/${request.requiredUserIds.length}',
               style: const TextStyle(fontSize: 13),
             ),
           ),
