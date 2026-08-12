@@ -231,9 +231,11 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
           !_isStoppingPageSync &&
           ref.read(pageSyncProvider.notifier).isRequestActive(command.requestId)) {
         try {
-          await roomNotifier
-              .updateCfiForRoom(roomId: roomId, cfi: targetCfi)
-              .timeout(const Duration(seconds: 10));
+          final pageSync = ref.read(pageSyncProvider.notifier);
+          if (!await pageSync.beginPositionPersistence(command.requestId)) {
+            return;
+          }
+          await roomNotifier.updateCfiForRoom(roomId: roomId, cfi: targetCfi);
           if (!mounted ||
               _isStoppingPageSync ||
               !ref
@@ -241,7 +243,6 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
                   .isRequestActive(command.requestId)) {
             return;
           }
-          final pageSync = ref.read(pageSyncProvider.notifier);
           final committed = await pageSync.commitPagePosition(targetCfi);
           if (committed) {
             await pageSync.acknowledgePagePosition(targetCfi);
@@ -249,7 +250,16 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
           }
           await Future<void>.delayed(const Duration(seconds: 2));
         } on RoomSessionChangedException {
-          return;
+          if (!mounted ||
+              _isStoppingPageSync ||
+              ref.read(roomProvider).currentRoom?.id != roomId ||
+              !ref
+                  .read(pageSyncProvider.notifier)
+                  .isRequestActive(command.requestId)) {
+            return;
+          }
+          await roomNotifier.refreshRoom();
+          await Future<void>.delayed(const Duration(seconds: 2));
         } catch (error) {
           ref
               .read(pageSyncProvider.notifier)

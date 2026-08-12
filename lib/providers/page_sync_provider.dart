@@ -98,6 +98,10 @@ class PageSyncNotifier extends StateNotifier<PageSyncState> {
     );
   }
 
+  Future<bool> beginPositionPersistence(String requestId) async {
+    return await _service?.beginPositionPersistence(requestId) ?? false;
+  }
+
   bool isRequestActive(String requestId) {
     return _service?.isRequestActive(requestId) ?? false;
   }

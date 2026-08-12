@@ -46,4 +46,27 @@ void main() {
     await transfer.dispose();
     await realtime.close();
   });
+
+  test('incoming transfer target is bound to the announced book hash', () async {
+    final realtime = RealtimeService(
+      channelFactory: (_, __) => throw StateError('not used'),
+    );
+    final transfer = FileTransferService(
+      realtimeService: realtime,
+      storageService: EpubStorageService(),
+      currentUserId: 'alice',
+    );
+    final firstHash = List.filled(64, 'A').join();
+    final secondHash = List.filled(64, 'b').join();
+
+    transfer.expectBook(firstHash);
+    expect(transfer.expectedBookHash, firstHash.toLowerCase());
+    transfer.expectBook(secondHash);
+    expect(transfer.expectedBookHash, secondHash);
+    transfer.markBookAvailable(secondHash);
+    expect(transfer.expectedBookHash, secondHash);
+
+    await transfer.dispose();
+    await realtime.close();
+  });
 }

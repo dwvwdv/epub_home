@@ -574,6 +574,55 @@ void main() {
       },
     );
 
+    test('database persistence pauses the ambiguous execute timeout', () async {
+      final transport = FakePageSyncTransport()
+        ..onlineUsers = [readyUser('user-a'), readyUser('user-b')];
+      final requester = createService(
+        transport,
+        currentCfi: cfi,
+        requestTimeout: const Duration(milliseconds: 20),
+      );
+      final follower = createService(
+        transport,
+        userId: 'user-b',
+        nickname: 'Bob',
+        currentCfi: cfi,
+        requestTimeout: const Duration(milliseconds: 20),
+      );
+      addTearDown(() async {
+        await requester.dispose();
+        await follower.dispose();
+        await transport.dispose();
+      });
+
+      await requester.requestPageTurn(
+        direction: PageTurnDirection.next,
+        fromCfi: cfi,
+      );
+      await flushEvents();
+      expect(await follower.confirmPageTurn(), isTrue);
+      await flushEvents();
+      final requestId = requester.currentState.currentRequest!.requestId;
+      expect(await requester.beginPositionPersistence(requestId), isTrue);
+      await flushEvents();
+
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(requester.currentState.status, SyncStatus.turning);
+      expect(follower.currentState.status, SyncStatus.turning);
+      expect(requester.currentState.currentRequest?.requestId, requestId);
+      expect(follower.currentState.currentRequest?.requestId, requestId);
+
+      requester.reportPositionPersistenceFailure(
+        requestId: requestId,
+        error: StateError('database unavailable'),
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await flushEvents();
+      expect(requester.currentState.status, SyncStatus.idle);
+      expect(follower.currentState.status, SyncStatus.idle);
+      expect(requester.currentState.errorMessage, contains('timed out'));
+    });
+
     test('missing display ack times out at the committed CFI', () async {
       final transport = FakePageSyncTransport()
         ..onlineUsers = [readyUser('user-a'), readyUser('user-b')];

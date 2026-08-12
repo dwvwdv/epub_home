@@ -228,15 +228,57 @@ void main() {
         List.filled(64, 'a').join(),
       );
     });
+
+    test('CFI write refreshes and retries one room revision conflict', () async {
+      final service = FakeRoomService()
+        ..cfiConflicts = 1
+        ..conflictRoom = testRoom(revision: 4);
+      final notifier = RoomNotifier(service);
+      addTearDown(notifier.dispose);
+
+      final room = await notifier.createRoom('Alice');
+      await notifier.updateCfiForRoom(
+        roomId: room!.id,
+        cfi: 'epubcfi(/6/22)',
+      );
+
+      expect(service.cfiExpectedRevisions, [0, 4]);
+      expect(notifier.state.currentRoom?.revision, 5);
+      expect(notifier.state.currentRoom?.currentCfi, 'epubcfi(/6/22)');
+    });
+
+    test('book share refreshes and retries one room revision conflict', () async {
+      final service = FakeRoomService()
+        ..bookConflicts = 1
+        ..conflictRoom = testRoom(revision: 7);
+      final notifier = RoomNotifier(service);
+      addTearDown(notifier.dispose);
+
+      await notifier.createRoom('Alice');
+      final bookHash = List.filled(64, 'b').join();
+      await notifier.updateBookShared(
+        bookTitle: 'Concurrent Book',
+        bookHash: bookHash,
+      );
+
+      expect(service.bookExpectedRevisions, [0, 7]);
+      expect(notifier.state.currentRoom?.revision, 8);
+      expect(notifier.state.currentRoom?.currentBookHash, bookHash);
+    });
   });
 }
 
-Room testRoom({String id = 'room-a', String code = 'AAAAAA'}) {
+Room testRoom({
+  String id = 'room-a',
+  String code = 'AAAAAA',
+  int revision = 0,
+}) {
   final now = DateTime.utc(2026, 8, 12);
   return Room(
     id: id,
     code: code,
     hostUserId: 'user-a',
+    revision: revision,
     createdAt: now,
     updatedAt: now,
   );
@@ -261,6 +303,11 @@ class FakeRoomService extends RoomService {
   Completer<Room?>? roomRead;
   int? lastCfiExpectedRevision;
   List<RoomMember> members = const [];
+  int cfiConflicts = 0;
+  int bookConflicts = 0;
+  Room conflictRoom = testRoom();
+  final List<int> cfiExpectedRevisions = [];
+  final List<int> bookExpectedRevisions = [];
 
   @override
   Future<Room> createRoom({required String nickname}) async => nextRoom;
@@ -295,11 +342,38 @@ class FakeRoomService extends RoomService {
     required int expectedRevision,
   }) async {
     lastCfiExpectedRevision = expectedRevision;
+    cfiExpectedRevisions.add(expectedRevision);
+    if (cfiConflicts > 0) {
+      cfiConflicts--;
+      throw RoomRevisionConflictException(conflictRoom);
+    }
     final error = cfiError;
     if (error != null) throw error;
     final pending = cfiWrite;
     if (pending != null) return pending.future;
-    return nextRoom.copyWith(currentCfi: cfi);
+    return nextRoom.copyWith(
+      currentCfi: cfi,
+      revision: expectedRevision + 1,
+    );
+  }
+
+  @override
+  Future<Room> updateRoomBook({
+    required String roomId,
+    required String bookTitle,
+    required String bookHash,
+    required int expectedRevision,
+  }) async {
+    bookExpectedRevisions.add(expectedRevision);
+    if (bookConflicts > 0) {
+      bookConflicts--;
+      throw RoomRevisionConflictException(conflictRoom);
+    }
+    return nextRoom.copyWith(
+      currentBookTitle: bookTitle,
+      currentBookHash: bookHash,
+      revision: expectedRevision + 1,
+    );
   }
 
   @override

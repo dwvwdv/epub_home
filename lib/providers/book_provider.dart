@@ -63,6 +63,7 @@ class BookNotifier extends StateNotifier<BookState> {
   String? _transferUserId;
   String? _transferRoomCode;
   String? _loadedBookHash;
+  String? _expectedBookHash;
   int _sessionGeneration = 0;
   int _transferGeneration = 0;
   Future<void> _transferOperationTail = Future<void>.value();
@@ -114,6 +115,12 @@ class BookNotifier extends StateNotifier<BookState> {
       currentUserId: currentUserId,
     );
     _transferService!.initialize();
+    final loadedBookHash = _loadedBookHash;
+    if (loadedBookHash != null && state.bookFile != null) {
+      _transferService!.markBookAvailable(loadedBookHash);
+    } else if (_expectedBookHash != null) {
+      _transferService!.expectBook(_expectedBookHash!);
+    }
     final transferGeneration = _transferGeneration;
 
     // Listen for transfer completion
@@ -196,6 +203,8 @@ class BookNotifier extends StateNotifier<BookState> {
         isLoading: false,
       );
       _loadedBookHash = hash;
+      _expectedBookHash = hash;
+      _transferService?.markBookAvailable(hash);
 
       // Update room with book info
       await ref
@@ -235,6 +244,7 @@ class BookNotifier extends StateNotifier<BookState> {
         transferGeneration == _transferGeneration) {
       state = state.copyWith(bookFile: bookFile, isLoading: false);
       _loadedBookHash = bookHash;
+      _expectedBookHash = bookHash;
 
       // Update DB member status and presence
       await ref.read(roomProvider.notifier).updateReceiverBookStatus();
@@ -255,6 +265,8 @@ class BookNotifier extends StateNotifier<BookState> {
     if (file != null) {
       state = state.copyWith(bookFile: file, isLoading: false);
       _loadedBookHash = bookHash;
+      _expectedBookHash = bookHash;
+      _transferService?.markBookAvailable(bookHash);
       await ref.read(roomProvider.notifier).updateReceiverBookStatus();
       if (!_isCurrent(generation)) return;
       await ref
@@ -271,13 +283,16 @@ class BookNotifier extends StateNotifier<BookState> {
 
   Future<void> prepareForSharedBook(String bookHash) async {
     final generation = _sessionGeneration;
+    _expectedBookHash = bookHash;
     if (hasBook(bookHash)) {
+      _transferService?.markBookAvailable(bookHash);
       await ref
           .read(presenceProvider.notifier)
           .updateHasBook(true, bookHash: bookHash);
       return;
     }
     if (!_isCurrent(generation)) return;
+    _transferService?.expectBook(bookHash);
     _loadedBookHash = null;
     state = const BookState(isLoading: true);
     await ref.read(presenceProvider.notifier).updateHasBook(false);
@@ -292,6 +307,7 @@ class BookNotifier extends StateNotifier<BookState> {
   Future<void> reset() async {
     ++_sessionGeneration;
     _loadedBookHash = null;
+    _expectedBookHash = null;
     state = const BookState();
     await _serializeTransferOperation(_disposeTransferServiceInternal);
   }

@@ -28,7 +28,10 @@ class FileTransferService {
   int _expectedTotalBytes = 0;
   Timer? _receiveTimer;
   bool _initialized = false;
-  bool _isAssembling = false;
+  int? _assemblingGeneration;
+  String? _expectedBookHash;
+  String? _availableBookHash;
+  int _receiveGeneration = 0;
   bool _disposed = false;
   Future<void>? _disposeFuture;
 
@@ -43,6 +46,7 @@ class FileTransferService {
   Stream<TransferState> get stateStream => _stateController.stream;
   TransferState get currentState => _state;
   int get subscriptionCount => _subscriptions.length;
+  String? get expectedBookHash => _expectedBookHash;
 
   void initialize() {
     if (_initialized || _disposed) return;
@@ -50,6 +54,37 @@ class FileTransferService {
     _subscriptions.add(
       _realtimeService.broadcastStream('book_chunk').listen(_onBookChunk),
     );
+  }
+
+  /// Bind incoming chunks to the book announced by the room. Delayed packets
+  /// from a previous share must not claim the receiver and block the new book.
+  void expectBook(String bookHash) {
+    if (_disposed) return;
+    final normalizedHash = bookHash.toLowerCase();
+    if (!_isSha256(normalizedHash)) throw ArgumentError('Invalid book hash');
+    if (_expectedBookHash == normalizedHash &&
+        _availableBookHash != normalizedHash) {
+      return;
+    }
+
+    ++_receiveGeneration;
+    _expectedBookHash = normalizedHash;
+    _availableBookHash = null;
+    _assemblingGeneration = null;
+    _clearReceiveBuffer();
+    if (!_state.isSending) _updateState(const TransferState.idle());
+  }
+
+  void markBookAvailable(String bookHash) {
+    if (_disposed) return;
+    final normalizedHash = bookHash.toLowerCase();
+    if (!_isSha256(normalizedHash)) throw ArgumentError('Invalid book hash');
+    ++_receiveGeneration;
+    _expectedBookHash = normalizedHash;
+    _availableBookHash = normalizedHash;
+    _assemblingGeneration = null;
+    _clearReceiveBuffer();
+    if (!_state.isSending) _updateState(const TransferState.idle());
   }
 
   Future<void> sendBook({
@@ -112,13 +147,16 @@ class FileTransferService {
         }
       }
 
-      _updateState(_state.copyWith(status: TransferStatus.completed));
+      _updateState(
+        _state.copyWith(status: TransferStatus.completed, isSending: false),
+      );
       debugPrint('Book sent: $totalChunks chunks');
     } catch (error) {
       _updateState(
         _state.copyWith(
           status: TransferStatus.failed,
           errorMessage: error.toString(),
+          isSending: false,
         ),
       );
       rethrow;
@@ -126,7 +164,7 @@ class FileTransferService {
   }
 
   void _onBookChunk(Map<String, dynamic> payload) {
-    if (_disposed || _isAssembling) return;
+    if (_disposed || _assemblingGeneration == _receiveGeneration) return;
 
     try {
       final senderId = payload['sender_id'];
@@ -143,6 +181,12 @@ class FileTransferService {
       }
       if (bookHash is! String || !_isSha256(bookHash)) {
         throw const FormatException('Invalid book hash');
+      }
+      final normalizedBookHash = bookHash.toLowerCase();
+      if ((_expectedBookHash != null &&
+              normalizedBookHash != _expectedBookHash) ||
+          normalizedBookHash == _availableBookHash) {
+        return;
       }
       if (chunkIndex is! int ||
           totalChunks is! int ||
@@ -167,7 +211,8 @@ class FileTransferService {
       }
 
       if (_pendingBookHash != null &&
-          (_pendingBookHash != bookHash || _pendingSenderId != senderId)) {
+          (_pendingBookHash != normalizedBookHash ||
+              _pendingSenderId != senderId)) {
         // Do not clear an in-flight transfer because an unrelated sender sent
         // a chunk to the room.
         return;
@@ -185,7 +230,7 @@ class FileTransferService {
       if (_pendingBookHash == null) {
         _beginReceive(
           senderId: senderId,
-          bookHash: bookHash,
+          bookHash: normalizedBookHash,
           totalChunks: totalChunks,
           totalBytes: totalBytes,
         );
@@ -215,16 +260,19 @@ class FileTransferService {
       if (isNewChunk) _restartReceiveTimeout();
 
       if (_receivedChunks.length == _expectedTotalChunks) {
-        _isAssembling = true;
+        _assemblingGeneration = _receiveGeneration;
         _receiveTimer?.cancel();
-        unawaited(_assembleAndSave(bookHash));
+        unawaited(
+          _assembleAndSave(normalizedBookHash, _receiveGeneration),
+        );
       }
     } on FormatException catch (error) {
       debugPrint('Rejected book chunk: $error');
       final belongsToCurrentTransfer =
           _pendingBookHash != null &&
           payload['sender_id'] == _pendingSenderId &&
-          payload['book_hash'] == _pendingBookHash;
+          payload['book_hash'] is String &&
+          (payload['book_hash'] as String).toLowerCase() == _pendingBookHash;
       // A malformed unrelated packet must not destroy a valid in-flight
       // transfer, but invalid data from its established sender must fail it.
       if (_pendingBookHash == null || belongsToCurrentTransfer) {
@@ -240,6 +288,7 @@ class FileTransferService {
     required int totalBytes,
   }) {
     _clearReceiveBuffer();
+    _expectedBookHash ??= bookHash;
     _pendingSenderId = senderId;
     _pendingBookHash = bookHash;
     _expectedTotalChunks = totalChunks;
@@ -254,7 +303,10 @@ class FileTransferService {
     );
   }
 
-  Future<void> _assembleAndSave(String expectedHash) async {
+  Future<void> _assembleAndSave(
+    String expectedHash,
+    int receiveGeneration,
+  ) async {
     try {
       final builder = BytesBuilder(copy: false);
       for (var index = 0; index < _expectedTotalChunks; index++) {
@@ -273,13 +325,23 @@ class FileTransferService {
       }
 
       await _storageService.saveBook(expectedHash, fullBytes);
+      if (_disposed ||
+          receiveGeneration != _receiveGeneration ||
+          _expectedBookHash != expectedHash) {
+        return;
+      }
+      _availableBookHash = expectedHash;
       _updateState(_state.copyWith(status: TransferStatus.completed));
       debugPrint('Book received and saved: $expectedHash');
       _clearReceiveBuffer();
     } catch (error) {
-      _failReceive(error.toString());
+      if (receiveGeneration == _receiveGeneration) {
+        _failReceive(error.toString());
+      }
     } finally {
-      _isAssembling = false;
+      if (_assemblingGeneration == receiveGeneration) {
+        _assemblingGeneration = null;
+      }
     }
   }
 
@@ -298,8 +360,11 @@ class FileTransferService {
   }
 
   void reset() {
+    ++_receiveGeneration;
+    _expectedBookHash = null;
+    _availableBookHash = null;
     _clearReceiveBuffer();
-    _isAssembling = false;
+    _assemblingGeneration = null;
     _updateState(const TransferState.idle());
   }
 
@@ -328,6 +393,7 @@ class FileTransferService {
 
   Future<void> _disposeInternal() async {
     _disposed = true;
+    ++_receiveGeneration;
     _clearReceiveBuffer();
     await Future.wait<void>([
       for (final subscription in _subscriptions) subscription.cancel(),

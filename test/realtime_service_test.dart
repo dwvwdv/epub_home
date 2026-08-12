@@ -27,6 +27,7 @@ void main() {
       RealtimeService.roomEvents,
       containsAll([
         'page_position_commit',
+        'page_position_persisting',
         'page_position_ack',
         'page_turn_complete',
         'reading_session_leave',

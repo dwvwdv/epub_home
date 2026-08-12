@@ -127,6 +127,9 @@ class PageSyncService {
           .listen(_onPageTurnExecute),
       _transport.broadcastStream('page_turn_cancel').listen(_onPageTurnCancel),
       _transport
+          .broadcastStream('page_position_persisting')
+          .listen(_onPositionPersisting),
+      _transport
           .broadcastStream('page_position_commit')
           .listen(_onPagePositionCommit),
       _transport
@@ -323,6 +326,36 @@ class PageSyncService {
         errorMessage: 'Page moved, but saving failed; retrying: $error',
       ),
     );
+  }
+
+  /// Database page writes are not safely cancellable: an HTTP timeout does not
+  /// prove the server transaction was rolled back. Pause the protocol timeout
+  /// while the sole writer waits for an unambiguous database result.
+  Future<bool> beginPositionPersistence(String requestId) async {
+    final request = _state.currentRequest;
+    if (_disposed ||
+        request == null ||
+        request.requestId != requestId ||
+        request.requestedByUserId != _currentUserId ||
+        _state.status != SyncStatus.turning ||
+        !_handledExecuteIds.contains(requestId)) {
+      return false;
+    }
+    final payload = {
+      'request_id': requestId,
+      'requested_by_user_id': _currentUserId,
+    };
+    try {
+      await _transport.broadcast(
+        event: 'page_position_persisting',
+        payload: payload,
+      );
+    } catch (_) {
+      await _cancelRequest(request, 'persistence_coordination_failed');
+      return false;
+    }
+    _applyPositionPersisting(payload);
+    return _state.currentRequest?.requestId == requestId;
   }
 
   bool isRequestActive(String requestId) {
@@ -559,6 +592,28 @@ class PageSyncService {
         targetCfi: targetCfi,
       ),
     );
+  }
+
+  void _onPositionPersisting(Map<String, dynamic> payload) {
+    _applyPositionPersisting(payload);
+  }
+
+  void _applyPositionPersisting(Map<String, dynamic> payload) {
+    if (_disposed) return;
+    final requestId = payload['request_id'];
+    final requestedByUserId = payload['requested_by_user_id'];
+    final request = _state.currentRequest;
+    if (requestId is! String ||
+        requestedByUserId is! String ||
+        request == null ||
+        request.requestId != requestId ||
+        request.requestedByUserId != requestedByUserId ||
+        _state.status != SyncStatus.turning ||
+        !_handledExecuteIds.contains(requestId)) {
+      return;
+    }
+    _cancelTimeout();
+    _updateState(_state.copyWith(clearError: true));
   }
 
   void _applyPositionCommit(PagePositionCommit commit) {

@@ -123,6 +123,7 @@ class RealtimeService {
     'page_turn_confirm',
     'page_turn_execute',
     'page_turn_cancel',
+    'page_position_persisting',
     'page_position_commit',
     'page_position_ack',
     'page_turn_complete',

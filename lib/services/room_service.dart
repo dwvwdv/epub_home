@@ -22,6 +22,15 @@ class RoomSessionChangedException implements Exception {
   String toString() => 'Room state changed before the update could finish';
 }
 
+class RoomRevisionConflictException implements Exception {
+  final Room currentRoom;
+
+  const RoomRevisionConflictException(this.currentRoom);
+
+  @override
+  String toString() => 'Room state was updated by another client';
+}
+
 class RoomService {
   SupabaseQuerySchema get _database => SupabaseService.database;
 
@@ -141,7 +150,7 @@ class RoomService {
         'This room membership is inactive or has expired.',
       );
     }
-    throw RoomSessionChangedException(roomId);
+    throw RoomRevisionConflictException(currentRoom);
   }
 
   Future<Map<String, dynamic>> leaveRoom({required String roomId}) async {

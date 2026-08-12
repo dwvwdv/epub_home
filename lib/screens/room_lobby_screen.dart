@@ -99,12 +99,14 @@ class _RoomLobbyScreenState extends ConsumerState<RoomLobbyScreen> {
           unawaited(
             ref.read(bookProvider.notifier).prepareForSharedBook(bookHash),
           );
-          ref
-              .read(roomProvider.notifier)
-              .onBookSharedReceived(
-                bookTitle: bookTitle ?? 'Unknown',
-                bookHash: bookHash,
-              );
+          final roomNotifier = ref.read(roomProvider.notifier);
+          roomNotifier.onBookSharedReceived(
+            bookTitle: bookTitle ?? 'Unknown',
+            bookHash: bookHash,
+          );
+          // The broadcast carries display metadata, while the authoritative
+          // revision comes from the database update that preceded it.
+          unawaited(roomNotifier.refreshRoom());
         }
       });
 
@@ -234,9 +236,13 @@ class _RoomLobbyScreenState extends ConsumerState<RoomLobbyScreen> {
     // short window to commit, then read the authoritative database state.
     await Future<void>.delayed(const Duration(milliseconds: 200));
     if (!mounted) return;
-    await ref
-        .read(roomProvider.notifier)
-        .refreshMembers(presenceUsers: ref.read(presenceProvider).onlineUsers);
+    final roomNotifier = ref.read(roomProvider.notifier);
+    await Future.wait<void>([
+      roomNotifier.refreshMembers(
+        presenceUsers: ref.read(presenceProvider).onlineUsers,
+      ),
+      roomNotifier.refreshRoom(),
+    ]);
   }
 
   @override
@@ -254,7 +260,10 @@ class _RoomLobbyScreenState extends ConsumerState<RoomLobbyScreen> {
       final previousIds = (previous?.onlineUserIds ?? const <String>[]).toSet();
       final nextIds = next.onlineUserIds.toSet();
       if (!const SetEquality<String>().equals(previousIds, nextIds)) {
-        notifier.refreshMembers(presenceUsers: next.onlineUsers);
+        unawaited(
+          notifier.refreshMembers(presenceUsers: next.onlineUsers),
+        );
+        unawaited(notifier.refreshRoom());
       }
     });
 

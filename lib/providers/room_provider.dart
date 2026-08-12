@@ -237,12 +237,33 @@ class RoomNotifier extends StateNotifier<RoomState> {
     if (room == null) return;
     final roomSessionGeneration = _roomSessionGeneration;
 
-    final updatedRoom = await _roomService.updateRoomBook(
-      roomId: room.id,
-      bookTitle: bookTitle,
-      bookHash: bookHash,
-      expectedRevision: room.revision,
-    );
+    var writeOrigin = room;
+    Room? updatedRoom;
+    for (var attempt = 0; attempt < 2; attempt++) {
+      try {
+        updatedRoom = await _roomService.updateRoomBook(
+          roomId: room.id,
+          bookTitle: bookTitle,
+          bookHash: bookHash,
+          expectedRevision: writeOrigin.revision,
+        );
+        break;
+      } on RoomRevisionConflictException catch (error) {
+        if (!_isCurrentRoomSession(room.id, roomSessionGeneration)) {
+          throw RoomSessionChangedException(room.id);
+        }
+        _applyRoomUpdate(
+          error.currentRoom,
+          originRoom: writeOrigin,
+          roomSessionGeneration: roomSessionGeneration,
+        );
+        writeOrigin = state.currentRoom!;
+        if (attempt == 1) rethrow;
+      }
+    }
+    if (updatedRoom == null) {
+      throw StateError('Room book update did not complete');
+    }
     if (!_isCurrentRoomSession(room.id, roomSessionGeneration)) {
       throw RoomSessionChangedException(room.id);
     }
@@ -261,7 +282,7 @@ class RoomNotifier extends StateNotifier<RoomState> {
 
     _applyRoomUpdate(
       updatedRoom,
-      originRoom: room,
+      originRoom: writeOrigin,
       roomSessionGeneration: roomSessionGeneration,
     );
 
@@ -307,16 +328,36 @@ class RoomNotifier extends StateNotifier<RoomState> {
     final readingSessionId = state.readingSessionId;
     final originRoom = state.currentRoom!;
 
-    final Room updatedRoom;
-    try {
-      updatedRoom = await _roomService.updateRoomCfi(
-        roomId: roomId,
-        cfi: cfi,
-        expectedRevision: originRoom.revision,
-      );
-    } on RoomSessionRevokedException catch (error) {
-      await _revokeSession(roomId, error.message);
-      rethrow;
+    var writeOrigin = originRoom;
+    Room? updatedRoom;
+    for (var attempt = 0; attempt < 2; attempt++) {
+      try {
+        updatedRoom = await _roomService.updateRoomCfi(
+          roomId: roomId,
+          cfi: cfi,
+          expectedRevision: writeOrigin.revision,
+        );
+        break;
+      } on RoomRevisionConflictException catch (error) {
+        if (_roomSessionGeneration != roomSessionGeneration ||
+            state.currentRoom?.id != roomId ||
+            state.readingSessionId != readingSessionId) {
+          throw RoomSessionChangedException(roomId);
+        }
+        _applyRoomUpdate(
+          error.currentRoom,
+          originRoom: writeOrigin,
+          roomSessionGeneration: roomSessionGeneration,
+        );
+        writeOrigin = state.currentRoom!;
+        if (attempt == 1) rethrow;
+      } on RoomSessionRevokedException catch (error) {
+        await _revokeSession(roomId, error.message);
+        rethrow;
+      }
+    }
+    if (updatedRoom == null) {
+      throw StateError('Room position update did not complete');
     }
     if (_roomSessionGeneration != roomSessionGeneration ||
         state.currentRoom?.id != roomId ||
@@ -325,7 +366,7 @@ class RoomNotifier extends StateNotifier<RoomState> {
     }
     _applyRoomUpdate(
       updatedRoom,
-      originRoom: originRoom,
+      originRoom: writeOrigin,
       roomSessionGeneration: roomSessionGeneration,
       clearError: true,
     );
