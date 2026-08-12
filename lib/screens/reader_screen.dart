@@ -65,6 +65,7 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
     final pageSync = ref.read(pageSyncProvider.notifier);
     pageSync.onPageTurn = _handlePageTurn;
     pageSync.onPositionCommit = _handlePositionCommit;
+    pageSync.onPositionRecovery = _handlePositionRecovery;
     await pageSync.initialize(
       realtimeService: realtimeService,
       currentUserId: authState.userId!,
@@ -97,8 +98,12 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
     pageSync.updateReaderContext(isReady: false, currentCfi: _currentCfi);
     unawaited(pageSync.stop());
     final presence = ref.read(presenceProvider.notifier);
-    unawaited(presence.updateReaderReady(false));
-    unawaited(presence.updateIsReading(false));
+    unawaited(() async {
+      // Preserve track ordering during route disposal so a slower
+      // reader_ready=false update cannot overwrite the final lobby state.
+      await presence.updateReaderReady(false);
+      await presence.updateIsReading(false);
+    }());
     _epubController = null;
     super.dispose();
   }
@@ -141,16 +146,31 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
     _displayCommittedPosition(commit.targetCfi);
   }
 
+  void _handlePositionRecovery(String targetCfi) {
+    if (!mounted || _isStoppingPageSync) return;
+    _queuedTurnCommand = null;
+    _awaitingTurnRelocation = null;
+    _displayingTargetCfi = null;
+    ref.read(bookProvider.notifier).updateCfi(targetCfi);
+
+    if (!_isReaderReady || _epubController == null) {
+      _queuedTargetCfi = targetCfi;
+      return;
+    }
+    _displayCommittedPosition(targetCfi);
+  }
+
   void _displayCommittedPosition(String targetCfi) {
     _queuedTargetCfi = null;
-    if (_currentCfi == targetCfi) return;
+    if (_currentCfi == targetCfi) {
+      unawaited(
+        ref.read(pageSyncProvider.notifier).acknowledgePagePosition(targetCfi),
+      );
+      return;
+    }
     _displayingTargetCfi = targetCfi;
-    ref.read(pageSyncProvider.notifier).updateReaderContext(
-          isReady: false,
-        );
-    unawaited(
-      ref.read(presenceProvider.notifier).updateReaderReady(false),
-    );
+    ref.read(pageSyncProvider.notifier).updateReaderContext(isReady: false);
+    unawaited(ref.read(presenceProvider.notifier).updateReaderReady(false));
     _epubController?.display(cfi: targetCfi);
   }
 
@@ -160,13 +180,10 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
       return;
     }
     _isReaderReady = false;
-    ref.read(pageSyncProvider.notifier).updateReaderContext(
-          isReady: false,
-          currentCfi: _currentCfi,
-        );
-    unawaited(
-      ref.read(presenceProvider.notifier).updateReaderReady(false),
-    );
+    ref
+        .read(pageSyncProvider.notifier)
+        .updateReaderContext(isReady: false, currentCfi: _currentCfi);
+    unawaited(ref.read(presenceProvider.notifier).updateReaderReady(false));
     setState(() => _viewerKey++);
   }
 
@@ -246,6 +263,10 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
                         displaySettings: EpubDisplaySettings(
                           flow: EpubFlow.paginated,
                           snap: false,
+                          // flutter_epub_viewer 1.2.x otherwise installs its
+                          // own Android detectSwipe() handler even when snap
+                          // is false, bypassing the consensus overlay.
+                          useSnapAnimationAndroid: true,
                         ),
                         initialCfi: _currentCfi,
                         onChaptersLoaded: (chapters) {
@@ -286,7 +307,8 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
                           ref
                               .read(pageSyncProvider.notifier)
                               .updateReaderContext(
-                                isReady: _isReaderReady &&
+                                isReady:
+                                    _isReaderReady &&
                                     _displayingTargetCfi == null,
                                 currentCfi: relocatedCfi,
                               );
@@ -295,6 +317,14 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
                               ref
                                   .read(presenceProvider.notifier)
                                   .updateReaderReady(true),
+                            );
+                          }
+
+                          if (committedTarget != null) {
+                            unawaited(
+                              ref
+                                  .read(pageSyncProvider.notifier)
+                                  .acknowledgePagePosition(relocatedCfi),
                             );
                           }
 
@@ -357,7 +387,8 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
   }
 
   Widget _buildBottomBar(PageSyncState syncState) {
-    final isIdle = syncState.status == SyncStatus.idle &&
+    final isIdle =
+        syncState.status == SyncStatus.idle &&
         _isReaderReady &&
         _displayingTargetCfi == null;
 
@@ -380,11 +411,13 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
             icon: const Icon(Icons.chevron_left, size: 32),
             onPressed: isIdle
                 ? () => unawaited(
-                      ref.read(pageSyncProvider.notifier).requestPageTurn(
-                            direction: PageTurnDirection.previous,
-                            fromCfi: _currentCfi,
-                          ),
-                    )
+                    ref
+                        .read(pageSyncProvider.notifier)
+                        .requestPageTurn(
+                          direction: PageTurnDirection.previous,
+                          fromCfi: _currentCfi,
+                        ),
+                  )
                 : null,
           ),
 
@@ -395,11 +428,13 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
             icon: const Icon(Icons.chevron_right, size: 32),
             onPressed: isIdle
                 ? () => unawaited(
-                      ref.read(pageSyncProvider.notifier).requestPageTurn(
-                            direction: PageTurnDirection.next,
-                            fromCfi: _currentCfi,
-                          ),
-                    )
+                    ref
+                        .read(pageSyncProvider.notifier)
+                        .requestPageTurn(
+                          direction: PageTurnDirection.next,
+                          fromCfi: _currentCfi,
+                        ),
+                  )
                 : null,
           ),
 
@@ -408,7 +443,8 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
           // Theme / color settings button (Feature 1)
           IconButton(
             icon: const Icon(Icons.palette_outlined),
-            onPressed: syncState.status == SyncStatus.idle &&
+            onPressed:
+                syncState.status == SyncStatus.idle &&
                     syncState.currentRequest == null &&
                     _isReaderReady &&
                     !_isStoppingPageSync
@@ -531,10 +567,7 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
           children: [
             Text(
               '${presenceState.onlineCount} Members Online',
-              style: const TextStyle(
-                fontSize: 18,
-                fontWeight: FontWeight.bold,
-              ),
+              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 16),
             ...presenceState.onlineUsers.map((user) {

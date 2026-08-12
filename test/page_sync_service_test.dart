@@ -30,40 +30,35 @@ void main() {
       expect(transport.sentEvents, isEmpty);
     });
 
-    test('fails closed when a reading presence has no readiness field',
-        () async {
-      final transport = FakePageSyncTransport()
-        ..onlineUsers = [
-          readyUser('user-a'),
-          {
-            'user_id': 'legacy-reader',
-            'is_reading': true,
-          },
-        ];
-      final service = createService(transport, currentCfi: cfi);
-      addTearDown(() async {
-        await service.dispose();
-        await transport.dispose();
-      });
+    test(
+      'fails closed when a reading presence has no readiness field',
+      () async {
+        final transport = FakePageSyncTransport()
+          ..onlineUsers = [
+            readyUser('user-a'),
+            {'user_id': 'legacy-reader', 'is_reading': true},
+          ];
+        final service = createService(transport, currentCfi: cfi);
+        addTearDown(() async {
+          await service.dispose();
+          await transport.dispose();
+        });
 
-      final requested = await service.requestPageTurn(
-        direction: PageTurnDirection.next,
-        fromCfi: cfi,
-      );
+        final requested = await service.requestPageTurn(
+          direction: PageTurnDirection.next,
+          fromCfi: cfi,
+        );
 
-      expect(requested, isFalse);
-      expect(service.currentState.errorMessage, contains('become ready'));
-    });
+        expect(requested, isFalse);
+        expect(service.currentState.errorMessage, contains('become ready'));
+      },
+    );
 
     test('fails closed while any online reader is still loading', () async {
       final transport = FakePageSyncTransport()
         ..onlineUsers = [
           readyUser('user-a'),
-          {
-            'user_id': 'user-b',
-            'is_reading': true,
-            'reader_ready': false,
-          },
+          {'user_id': 'user-b', 'is_reading': true, 'reader_ready': false},
         ];
       final service = createService(transport, currentCfi: cfi);
       addTearDown(() async {
@@ -81,122 +76,143 @@ void main() {
       expect(transport.sentEvents, isEmpty);
     });
 
-    test('quorum contains unique ready readers and excludes lobby users',
-        () async {
-      final transport = FakePageSyncTransport()
-        ..onlineUsers = [
-          readyUser('user-a'),
-          readyUser('user-a'),
-          readyUser('user-b'),
-          readyUser('user-b'),
-          {
-            'user_id': 'lobby-user',
-            'is_reading': false,
-            'reader_ready': true,
-          },
-        ];
-      final service = createService(transport, currentCfi: cfi);
-      addTearDown(() async {
-        await service.dispose();
-        await transport.dispose();
-      });
+    test(
+      'quorum contains unique ready readers and excludes lobby users',
+      () async {
+        final transport = FakePageSyncTransport()
+          ..onlineUsers = [
+            readyUser('user-a'),
+            readyUser('user-a'),
+            readyUser('user-b'),
+            readyUser('user-b'),
+            {
+              'user_id': 'lobby-user',
+              'is_reading': false,
+              'reader_ready': true,
+            },
+          ];
+        final service = createService(transport, currentCfi: cfi);
+        addTearDown(() async {
+          await service.dispose();
+          await transport.dispose();
+        });
 
-      final requested = await service.requestPageTurn(
-        direction: PageTurnDirection.next,
-        fromCfi: cfi,
-      );
+        final requested = await service.requestPageTurn(
+          direction: PageTurnDirection.next,
+          fromCfi: cfi,
+        );
 
-      expect(requested, isTrue);
-      expect(service.currentState.status, SyncStatus.requesting);
-      expect(
-        service.currentState.currentRequest!.requiredUserIds,
-        {'user-a', 'user-b'},
-      );
-    });
+        expect(requested, isTrue);
+        expect(service.currentState.status, SyncStatus.requesting);
+        expect(service.currentState.currentRequest!.requiredUserIds, {
+          'user-a',
+          'user-b',
+        });
+      },
+    );
 
-    test('self echo executes and commits a requester turn exactly once',
-        () async {
-      final transport = FakePageSyncTransport()
-        ..onlineUsers = [readyUser('user-a')];
-      final service = createService(transport, currentCfi: cfi);
-      var turns = 0;
-      var commits = 0;
-      service.onPageTurn = (_) => turns++;
-      service.onPositionCommit = (_) => commits++;
-      addTearDown(() async {
-        await service.dispose();
-        await transport.dispose();
-      });
+    test(
+      'self echo executes and commits a requester turn exactly once',
+      () async {
+        final transport = FakePageSyncTransport()
+          ..onlineUsers = [readyUser('user-a')];
+        final service = createService(transport, currentCfi: cfi);
+        var turns = 0;
+        var commits = 0;
+        service.onPageTurn = (_) => turns++;
+        service.onPositionCommit = (_) => commits++;
+        addTearDown(() async {
+          await service.dispose();
+          await transport.dispose();
+        });
 
-      await service.requestPageTurn(
-        direction: PageTurnDirection.next,
-        fromCfi: cfi,
-      );
-      await flushEvents();
+        await service.requestPageTurn(
+          direction: PageTurnDirection.next,
+          fromCfi: cfi,
+        );
+        await flushEvents();
 
-      expect(turns, 1);
-      expect(service.currentState.status, SyncStatus.turning);
+        expect(turns, 1);
+        expect(service.currentState.status, SyncStatus.turning);
 
-      final execute = transport.sentEvents.singleWhere(
-        (event) => event.event == 'page_turn_execute',
-      );
-      transport.emit('page_turn_execute', execute.payload);
-      await flushEvents();
-      expect(turns, 1);
+        final execute = transport.sentEvents.singleWhere(
+          (event) => event.event == 'page_turn_execute',
+        );
+        transport.emit('page_turn_execute', execute.payload);
+        await flushEvents();
+        expect(turns, 1);
 
-      final committed = await service.commitPagePosition('epubcfi(/6/6)');
-      await flushEvents();
+        const targetCfi = 'epubcfi(/6/6)';
+        service.updateReaderContext(isReady: true, currentCfi: targetCfi);
+        final committed = await service.commitPagePosition(targetCfi);
+        await flushEvents();
 
-      expect(committed, isTrue);
-      expect(turns, 1);
-      expect(commits, 1);
-      expect(service.currentState.status, SyncStatus.idle);
-      expect(
-        transport.sentEvents.where((event) => event.event == 'page_turn_execute'),
-        hasLength(1),
-      );
+        expect(committed, isTrue);
+        expect(turns, 1);
+        expect(commits, 1);
+        expect(service.currentState.status, SyncStatus.idle);
+        expect(
+          transport.sentEvents.where(
+            (event) => event.event == 'page_turn_execute',
+          ),
+          hasLength(1),
+        );
+        expect(
+          transport.sentEvents.where(
+            (event) => event.event == 'page_position_ack',
+          ),
+          hasLength(1),
+        );
+        expect(
+          transport.sentEvents.where(
+            (event) => event.event == 'page_turn_complete',
+          ),
+          hasLength(1),
+        );
 
-      transport.emit('page_turn_execute', execute.payload);
-      await flushEvents();
-      expect(turns, 1);
-    });
+        transport.emit('page_turn_execute', execute.payload);
+        await flushEvents();
+        expect(turns, 1);
+      },
+    );
 
-    test('ignores confirmations from users outside the required quorum',
-        () async {
-      final transport = FakePageSyncTransport()
-        ..onlineUsers = [readyUser('user-a'), readyUser('user-b')];
-      final service = createService(transport, currentCfi: cfi);
-      var turns = 0;
-      service.onPageTurn = (_) => turns++;
-      addTearDown(() async {
-        await service.dispose();
-        await transport.dispose();
-      });
+    test(
+      'ignores confirmations from users outside the required quorum',
+      () async {
+        final transport = FakePageSyncTransport()
+          ..onlineUsers = [readyUser('user-a'), readyUser('user-b')];
+        final service = createService(transport, currentCfi: cfi);
+        var turns = 0;
+        service.onPageTurn = (_) => turns++;
+        addTearDown(() async {
+          await service.dispose();
+          await transport.dispose();
+        });
 
-      await service.requestPageTurn(
-        direction: PageTurnDirection.next,
-        fromCfi: cfi,
-      );
-      final requestId = service.currentState.currentRequest!.requestId;
+        await service.requestPageTurn(
+          direction: PageTurnDirection.next,
+          fromCfi: cfi,
+        );
+        final requestId = service.currentState.currentRequest!.requestId;
 
-      transport.emit('page_turn_confirm', {
-        'request_id': requestId,
-        'user_id': 'outsider',
-      });
-      await flushEvents();
-      expect(
-        service.currentState.currentRequest!.confirmedUserIds,
-        {'user-a'},
-      );
-      expect(turns, 0);
+        transport.emit('page_turn_confirm', {
+          'request_id': requestId,
+          'user_id': 'outsider',
+        });
+        await flushEvents();
+        expect(service.currentState.currentRequest!.confirmedUserIds, {
+          'user-a',
+        });
+        expect(turns, 0);
 
-      transport.emit('page_turn_confirm', {
-        'request_id': requestId,
-        'user_id': 'user-b',
-      });
-      await flushEvents();
-      expect(turns, 1);
-    });
+        transport.emit('page_turn_confirm', {
+          'request_id': requestId,
+          'user_id': 'user-b',
+        });
+        await flushEvents();
+        expect(turns, 1);
+      },
+    );
 
     test('validates executor identity and direction', () async {
       final transport = FakePageSyncTransport()
@@ -216,12 +232,24 @@ void main() {
         await transport.dispose();
       });
 
-      transport.emit('page_turn_request', requestPayload(
-        requestId: 'request-1',
-        fromCfi: cfi,
-      ));
+      transport.emit(
+        'page_turn_request',
+        requestPayload(requestId: 'request-1', fromCfi: cfi),
+      );
       await flushEvents();
       expect(service.currentState.status, SyncStatus.confirming);
+
+      // Execute is invalid until this reader has explicitly confirmed.
+      transport.emit('page_turn_execute', {
+        'request_id': 'request-1',
+        'requested_by_user_id': 'user-a',
+        'direction': 'next',
+      });
+      await flushEvents();
+      expect(turns, 0);
+
+      await service.confirmPageTurn();
+      await flushEvents();
 
       transport.emit('page_turn_execute', {
         'request_id': 'request-1',
@@ -264,8 +292,241 @@ void main() {
       });
       await flushEvents();
       expect(commits, 1);
+      expect(service.currentState.status, SyncStatus.turning);
+
+      const targetCfi = 'epubcfi(/6/6)';
+      service.updateReaderContext(isReady: true, currentCfi: targetCfi);
+      expect(await service.acknowledgePagePosition(targetCfi), isTrue);
+      transport.emit('page_turn_complete', {
+        'request_id': 'request-1',
+        'requested_by_user_id': 'user-a',
+        'completed_by_user_id': 'user-a',
+        'direction': 'next',
+        'from_cfi': cfi,
+        'target_cfi': targetCfi,
+      });
+      await flushEvents();
       expect(service.currentState.status, SyncStatus.idle);
     });
+
+    test(
+      'requester waits for every display ack and completes only once',
+      () async {
+        final transport = FakePageSyncTransport()
+          ..onlineUsers = [readyUser('user-a'), readyUser('user-b')];
+        final service = createService(transport, currentCfi: cfi);
+        var turns = 0;
+        service.onPageTurn = (_) => turns++;
+        addTearDown(() async {
+          await service.dispose();
+          await transport.dispose();
+        });
+
+        await service.requestPageTurn(
+          direction: PageTurnDirection.next,
+          fromCfi: cfi,
+        );
+        final requestId = service.currentState.currentRequest!.requestId;
+        transport.emit('page_turn_confirm', {
+          'request_id': requestId,
+          'user_id': 'user-b',
+        });
+        await flushEvents();
+        expect(turns, 1);
+
+        const targetCfi = 'epubcfi(/6/8)';
+        service.updateReaderContext(isReady: true, currentCfi: targetCfi);
+        expect(await service.commitPagePosition(targetCfi), isTrue);
+        await flushEvents();
+
+        expect(service.currentState.status, SyncStatus.turning);
+        expect(
+          transport.sentEvents.where(
+            (event) => event.event == 'page_turn_complete',
+          ),
+          isEmpty,
+        );
+
+        transport.emit('page_position_ack', {
+          'request_id': requestId,
+          'user_id': 'user-b',
+          'target_cfi': targetCfi,
+        });
+        transport.emit('page_position_ack', {
+          'request_id': requestId,
+          'user_id': 'user-b',
+          'target_cfi': targetCfi,
+        });
+        await flushEvents();
+
+        expect(service.currentState.status, SyncStatus.idle);
+        expect(
+          transport.sentEvents.where(
+            (event) => event.event == 'page_turn_complete',
+          ),
+          hasLength(1),
+        );
+        transport.emit('page_turn_execute', {
+          'request_id': requestId,
+          'requested_by_user_id': 'user-a',
+          'direction': 'next',
+        });
+        await flushEvents();
+        expect(turns, 1);
+      },
+    );
+
+    test(
+      'ignores a delayed confirmation from a reader that became unready',
+      () async {
+        final transport = FakePageSyncTransport()
+          ..onlineUsers = [readyUser('user-a'), readyUser('user-b')];
+        final service = createService(transport, currentCfi: cfi);
+        var turns = 0;
+        service.onPageTurn = (_) => turns++;
+        addTearDown(() async {
+          await service.dispose();
+          await transport.dispose();
+        });
+
+        await service.requestPageTurn(
+          direction: PageTurnDirection.next,
+          fromCfi: cfi,
+        );
+        final requestId = service.currentState.currentRequest!.requestId;
+        transport.onlineUsers = [
+          readyUser('user-a'),
+          {'user_id': 'user-b', 'is_reading': true, 'reader_ready': false},
+        ];
+        transport.emit('page_turn_confirm', {
+          'request_id': requestId,
+          'user_id': 'user-b',
+        });
+        await flushEvents();
+
+        expect(turns, 0);
+        expect(service.currentState.currentRequest!.confirmedUserIds, {
+          'user-a',
+        });
+      },
+    );
+
+    test(
+      'execute timeout rolls the reader back and releases the lock',
+      () async {
+        final transport = FakePageSyncTransport()
+          ..onlineUsers = [readyUser('user-a')];
+        final service = createService(
+          transport,
+          currentCfi: cfi,
+          requestTimeout: const Duration(milliseconds: 20),
+        );
+        final recoveries = <String>[];
+        service.onPositionRecovery = recoveries.add;
+        addTearDown(() async {
+          await service.dispose();
+          await transport.dispose();
+        });
+
+        await service.requestPageTurn(
+          direction: PageTurnDirection.next,
+          fromCfi: cfi,
+        );
+        expect(service.currentState.status, SyncStatus.turning);
+
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        expect(service.currentState.status, SyncStatus.idle);
+        expect(service.currentState.currentRequest, isNull);
+        expect(service.currentState.errorMessage, contains('timed out'));
+        expect(recoveries, [cfi]);
+      },
+    );
+
+    test('missing display ack times out at the committed CFI', () async {
+      final transport = FakePageSyncTransport()
+        ..onlineUsers = [readyUser('user-a'), readyUser('user-b')];
+      final service = createService(
+        transport,
+        currentCfi: cfi,
+        requestTimeout: const Duration(milliseconds: 20),
+      );
+      final recoveries = <String>[];
+      service.onPositionRecovery = recoveries.add;
+      addTearDown(() async {
+        await service.dispose();
+        await transport.dispose();
+      });
+
+      await service.requestPageTurn(
+        direction: PageTurnDirection.next,
+        fromCfi: cfi,
+      );
+      final requestId = service.currentState.currentRequest!.requestId;
+      transport.emit('page_turn_confirm', {
+        'request_id': requestId,
+        'user_id': 'user-b',
+      });
+      await flushEvents();
+
+      const targetCfi = 'epubcfi(/6/10)';
+      service.updateReaderContext(isReady: true, currentCfi: targetCfi);
+      expect(await service.commitPagePosition(targetCfi), isTrue);
+      await flushEvents();
+      expect(service.currentState.status, SyncStatus.turning);
+
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(service.currentState.status, SyncStatus.idle);
+      expect(service.currentState.errorMessage, contains('timed out'));
+      expect(recoveries, [targetCfi]);
+      expect(
+        transport.sentEvents.where(
+          (event) => event.event == 'page_turn_complete',
+        ),
+        isEmpty,
+      );
+    });
+
+    test(
+      'completion send failure keeps the committed CFI authoritative',
+      () async {
+        final transport = FakePageSyncTransport()
+          ..onlineUsers = [readyUser('user-a'), readyUser('user-b')];
+        final service = createService(transport, currentCfi: cfi);
+        final recoveries = <String>[];
+        service.onPositionRecovery = recoveries.add;
+        addTearDown(() async {
+          await service.dispose();
+          await transport.dispose();
+        });
+
+        await service.requestPageTurn(
+          direction: PageTurnDirection.next,
+          fromCfi: cfi,
+        );
+        final requestId = service.currentState.currentRequest!.requestId;
+        transport.emit('page_turn_confirm', {
+          'request_id': requestId,
+          'user_id': 'user-b',
+        });
+        await flushEvents();
+
+        const targetCfi = 'epubcfi(/6/12)';
+        service.updateReaderContext(isReady: true, currentCfi: targetCfi);
+        expect(await service.commitPagePosition(targetCfi), isTrue);
+        await flushEvents();
+        transport.failingEvents.add('page_turn_complete');
+        transport.emit('page_position_ack', {
+          'request_id': requestId,
+          'user_id': 'user-b',
+          'target_cfi': targetCfi,
+        });
+        await flushEvents();
+
+        expect(service.currentState.status, SyncStatus.idle);
+        expect(service.currentState.errorMessage, contains('complete'));
+        expect(recoveries, [targetCfi]);
+      },
+    );
 
     test('arbitrates a lower request id while already waiting', () async {
       final transport = FakePageSyncTransport()
@@ -281,18 +542,18 @@ void main() {
         await transport.dispose();
       });
 
-      transport.emit('page_turn_request', requestPayload(
-        requestId: 'z-request',
-        fromCfi: cfi,
-      ));
+      transport.emit(
+        'page_turn_request',
+        requestPayload(requestId: 'z-request', fromCfi: cfi),
+      );
       await flushEvents();
       await service.confirmPageTurn();
       expect(service.currentState.status, SyncStatus.waiting);
 
-      transport.emit('page_turn_request', requestPayload(
-        requestId: 'a-request',
-        fromCfi: cfi,
-      ));
+      transport.emit(
+        'page_turn_request',
+        requestPayload(requestId: 'a-request', fromCfi: cfi),
+      );
       await flushEvents();
 
       expect(service.currentState.status, SyncStatus.confirming);
@@ -351,8 +612,7 @@ void main() {
       );
       commitTransport.failingEvents.add('page_position_commit');
 
-      final committed =
-          await commitService.commitPagePosition('epubcfi(/6/6)');
+      final committed = await commitService.commitPagePosition('epubcfi(/6/6)');
       expect(committed, isFalse);
       expect(commitService.currentState.status, SyncStatus.idle);
       expect(commitService.currentState.errorMessage, contains('synchronize'));
@@ -372,10 +632,10 @@ void main() {
         await transport.dispose();
       });
 
-      transport.emit('page_turn_request', requestPayload(
-        requestId: 'stale-request',
-        fromCfi: 'epubcfi(/6/2)',
-      ));
+      transport.emit(
+        'page_turn_request',
+        requestPayload(requestId: 'stale-request', fromCfi: 'epubcfi(/6/2)'),
+      );
       await flushEvents();
 
       expect(service.currentState.status, SyncStatus.idle);
@@ -389,62 +649,105 @@ void main() {
       );
     });
 
-    test('presence sync cancels when a required reader becomes unready',
-        () async {
-      final transport = FakePageSyncTransport()
-        ..onlineUsers = [readyUser('user-a'), readyUser('user-b')];
-      final service = createService(transport, currentCfi: cfi);
-      addTearDown(() async {
+    test(
+      'rejects an expired request after a reader session restarts',
+      () async {
+        final transport = FakePageSyncTransport()
+          ..onlineUsers = [readyUser('user-a'), readyUser('user-b')];
+        final service = createService(
+          transport,
+          userId: 'user-b',
+          nickname: 'Bob',
+          currentCfi: cfi,
+        );
+        addTearDown(() async {
+          await service.dispose();
+          await transport.dispose();
+        });
+
+        transport.emit(
+          'page_turn_request',
+          requestPayload(
+            requestId: 'expired-request',
+            fromCfi: cfi,
+            requestedAt: DateTime.now().toUtc().subtract(
+              const Duration(minutes: 1),
+            ),
+          ),
+        );
+        await flushEvents();
+
+        expect(service.currentState.status, SyncStatus.idle);
+        expect(
+          transport.sentEvents.any(
+            (event) =>
+                event.event == 'page_turn_cancel' &&
+                event.payload['request_id'] == 'expired-request',
+          ),
+          isTrue,
+        );
+      },
+    );
+
+    test(
+      'presence sync cancels when a required reader becomes unready',
+      () async {
+        final transport = FakePageSyncTransport()
+          ..onlineUsers = [readyUser('user-a'), readyUser('user-b')];
+        final service = createService(transport, currentCfi: cfi);
+        addTearDown(() async {
+          await service.dispose();
+          await transport.dispose();
+        });
+
+        await service.requestPageTurn(
+          direction: PageTurnDirection.next,
+          fromCfi: cfi,
+        );
+        final requestId = service.currentState.currentRequest!.requestId;
+        transport.onlineUsers = [
+          readyUser('user-a'),
+          {'user_id': 'user-b', 'is_reading': true, 'reader_ready': false},
+        ];
+        transport.emitPresence({'event': 'sync'});
+        await flushEvents();
+
+        expect(service.currentState.status, SyncStatus.idle);
+        expect(service.currentState.errorMessage, contains('not_ready'));
+        expect(
+          transport.sentEvents.any(
+            (event) =>
+                event.event == 'page_turn_cancel' &&
+                event.payload['request_id'] == requestId,
+          ),
+          isTrue,
+        );
+      },
+    );
+
+    test(
+      'dispose is idempotent, removes listeners, and ignores later events',
+      () async {
+        final transport = FakePageSyncTransport()
+          ..onlineUsers = [readyUser('user-a')];
+        final service = createService(transport, currentCfi: cfi);
+
         await service.dispose();
+        await service.dispose();
+        transport.emit(
+          'page_turn_request',
+          requestPayload(
+            requestId: 'after-dispose',
+            fromCfi: cfi,
+            requiredUsers: const ['user-a'],
+          ),
+        );
+        await flushEvents();
+
+        expect(service.currentState.status, SyncStatus.idle);
         await transport.dispose();
-      });
-
-      await service.requestPageTurn(
-        direction: PageTurnDirection.next,
-        fromCfi: cfi,
-      );
-      final requestId = service.currentState.currentRequest!.requestId;
-      transport.onlineUsers = [
-        readyUser('user-a'),
-        {
-          'user_id': 'user-b',
-          'is_reading': true,
-          'reader_ready': false,
-        },
-      ];
-      transport.emitPresence({'event': 'sync'});
-      await flushEvents();
-
-      expect(service.currentState.status, SyncStatus.idle);
-      expect(service.currentState.errorMessage, contains('not_ready'));
-      expect(
-        transport.sentEvents.any(
-          (event) =>
-              event.event == 'page_turn_cancel' &&
-              event.payload['request_id'] == requestId,
-        ),
-        isTrue,
-      );
-    });
-
-    test('dispose is idempotent, removes listeners, and ignores later events',
-        () async {
-      final transport = FakePageSyncTransport()
-        ..onlineUsers = [readyUser('user-a')];
-      final service = createService(transport, currentCfi: cfi);
-
-      await service.dispose();
-      await service.dispose();
-      transport.emit('page_turn_request', requestPayload(
-        requestId: 'after-dispose',
-        fromCfi: cfi,
-        requiredUsers: const ['user-a'],
-      ));
-      await flushEvents();
-
-      expect(service.currentState.status, SyncStatus.idle);
-      await transport.dispose();
-    });
+      },
+    );
   });
 }
 
@@ -453,11 +756,13 @@ PageSyncService createService(
   String userId = 'user-a',
   String nickname = 'Alice',
   required String currentCfi,
+  Duration requestTimeout = const Duration(seconds: 30),
 }) {
   final service = PageSyncService(
     transport: transport,
     currentUserId: userId,
     currentNickname: nickname,
+    requestTimeout: requestTimeout,
   );
   service.updateReaderContext(isReady: true, currentCfi: currentCfi);
   service.initialize();
@@ -465,16 +770,17 @@ PageSyncService createService(
 }
 
 Map<String, dynamic> readyUser(String userId) => {
-      'user_id': userId,
-      'nickname': userId,
-      'is_reading': true,
-      'reader_ready': true,
-    };
+  'user_id': userId,
+  'nickname': userId,
+  'is_reading': true,
+  'reader_ready': true,
+};
 
 Map<String, dynamic> requestPayload({
   required String requestId,
   required String fromCfi,
   List<String> requiredUsers = const ['user-a', 'user-b'],
+  DateTime? requestedAt,
 }) {
   return {
     'request_id': requestId,
@@ -482,7 +788,7 @@ Map<String, dynamic> requestPayload({
     'nickname': 'Alice',
     'direction': 'next',
     'from_cfi': fromCfi,
-    'requested_at': DateTime.now().toUtc().toIso8601String(),
+    'requested_at': (requestedAt ?? DateTime.now().toUtc()).toIso8601String(),
     'required_users': requiredUsers,
   };
 }
@@ -517,8 +823,7 @@ class FakePageSyncTransport implements PageSyncTransport {
   }
 
   @override
-  Stream<Map<String, dynamic>> get presenceStream =>
-      _presenceController.stream;
+  Stream<Map<String, dynamic>> get presenceStream => _presenceController.stream;
 
   @override
   List<Map<String, dynamic>> getOnlineUsers() => onlineUsers;

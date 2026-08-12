@@ -49,18 +49,23 @@ class RealtimePageSyncTransport implements PageSyncTransport {
 }
 
 class PageSyncService {
-  static const _requestTimeout = Duration(seconds: 30);
+  static const _maxClockSkew = Duration(seconds: 5);
 
   final PageSyncTransport _transport;
   final String _currentUserId;
   final String _currentNickname;
   final Uuid _uuid;
+  final Duration _requestTimeout;
 
   final _stateController = StreamController<PageSyncState>.broadcast();
   final List<StreamSubscription<Map<String, dynamic>>> _subscriptions = [];
   final Set<String> _handledExecuteIds = {};
   final Set<String> _handledCommitIds = {};
+  final Set<String> _handledCompleteIds = {};
   final Set<String> _executeInFlightIds = {};
+  final Set<String> _ackInFlightIds = {};
+  final Set<String> _sentAckIds = {};
+  final Set<String> _completeInFlightIds = {};
   final Set<String> _seenRequestIds = {};
 
   Timer? _timeoutTimer;
@@ -70,19 +75,24 @@ class PageSyncService {
   bool _presenceSynchronized = false;
   bool _readerReady = false;
   String? _currentCfi;
+  PagePositionCommit? _positionCommit;
+  final Set<String> _positionAckUserIds = {};
 
   void Function(PageTurnCommand command)? onPageTurn;
   void Function(PagePositionCommit commit)? onPositionCommit;
+  void Function(String targetCfi)? onPositionRecovery;
 
   PageSyncService({
     required PageSyncTransport transport,
     required String currentUserId,
     required String currentNickname,
     Uuid uuid = const Uuid(),
-  })  : _transport = transport,
-        _currentUserId = currentUserId,
-        _currentNickname = currentNickname,
-        _uuid = uuid;
+    Duration requestTimeout = const Duration(seconds: 30),
+  }) : _transport = transport,
+       _currentUserId = currentUserId,
+       _currentNickname = currentNickname,
+       _uuid = uuid,
+       _requestTimeout = requestTimeout;
 
   Stream<PageSyncState> get stateStream => _stateController.stream;
   PageSyncState get currentState => _state;
@@ -101,18 +111,22 @@ class PageSyncService {
       _transport
           .broadcastStream('page_turn_execute')
           .listen(_onPageTurnExecute),
-      _transport
-          .broadcastStream('page_turn_cancel')
-          .listen(_onPageTurnCancel),
+      _transport.broadcastStream('page_turn_cancel').listen(_onPageTurnCancel),
       _transport
           .broadcastStream('page_position_commit')
           .listen(_onPagePositionCommit),
+      _transport
+          .broadcastStream('page_position_ack')
+          .listen(_onPagePositionAck),
+      _transport
+          .broadcastStream('page_turn_complete')
+          .listen(_onPageTurnComplete),
       _transport.presenceStream.listen(_onPresenceChange),
     ]);
 
     _presenceSynchronized = _transport.getOnlineUsers().any(
-          (user) => user['user_id'] == _currentUserId,
-        );
+      (user) => user['user_id'] == _currentUserId,
+    );
     _updateState(const PageSyncState.idle());
   }
 
@@ -168,10 +182,9 @@ class PageSyncService {
     );
     _seenRequestIds.add(request.requestId);
 
-    _updateState(PageSyncState(
-      status: SyncStatus.requesting,
-      currentRequest: request,
-    ));
+    _updateState(
+      PageSyncState(status: SyncStatus.requesting, currentRequest: request),
+    );
     _startTimeout(request.requestId);
 
     try {
@@ -180,7 +193,7 @@ class PageSyncService {
         payload: request.toJson(),
       );
     } catch (error) {
-      _setError('Could not request a page turn: $error');
+      _failRequest(request, 'Could not request a page turn: $error');
       return false;
     }
 
@@ -207,13 +220,10 @@ class PageSyncService {
     try {
       await _transport.broadcast(
         event: 'page_turn_confirm',
-        payload: {
-          'request_id': request.requestId,
-          'user_id': _currentUserId,
-        },
+        payload: {'request_id': request.requestId, 'user_id': _currentUserId},
       );
     } catch (error) {
-      _setError('Could not confirm the page turn: $error');
+      _failRequest(request, 'Could not confirm the page turn: $error');
       return false;
     }
 
@@ -222,10 +232,9 @@ class PageSyncService {
     final updated = current.copyWith(
       confirmedUserIds: {...current.confirmedUserIds, _currentUserId},
     );
-    _updateState(PageSyncState(
-      status: SyncStatus.waiting,
-      currentRequest: updated,
-    ));
+    _updateState(
+      PageSyncState(status: SyncStatus.waiting, currentRequest: updated),
+    );
     _checkConsensus(updated);
     return true;
   }
@@ -266,12 +275,59 @@ class PageSyncService {
         payload: commit.toJson(),
       );
     } catch (error) {
-      _setError('Could not synchronize the new page: $error');
+      _failRequest(request, 'Could not synchronize the new page: $error');
       return false;
     }
 
     _applyPositionCommit(commit);
+    unawaited(acknowledgePagePosition(targetCfi));
     return true;
+  }
+
+  /// Acknowledges that this reader has actually displayed the committed CFI.
+  ///
+  /// The request remains locked until every required reader acknowledges and
+  /// the requester broadcasts a final completion event. This prevents a fast
+  /// client from starting another turn while a slower client is still moving.
+  Future<bool> acknowledgePagePosition(String targetCfi) async {
+    final request = _state.currentRequest;
+    final commit = _positionCommit;
+    if (_disposed ||
+        request == null ||
+        commit == null ||
+        request.requestId != commit.requestId ||
+        _state.status != SyncStatus.turning ||
+        !request.requiredUserIds.contains(_currentUserId) ||
+        !_readerReady ||
+        _currentCfi != targetCfi ||
+        commit.targetCfi != targetCfi) {
+      return false;
+    }
+    if (_sentAckIds.contains(request.requestId)) return true;
+    if (!_ackInFlightIds.add(request.requestId)) return true;
+
+    try {
+      await _transport.broadcast(
+        event: 'page_position_ack',
+        payload: {
+          'request_id': request.requestId,
+          'user_id': _currentUserId,
+          'target_cfi': targetCfi,
+        },
+      );
+      _sentAckIds.add(request.requestId);
+      _applyPositionAck(
+        requestId: request.requestId,
+        userId: _currentUserId,
+        targetCfi: targetCfi,
+      );
+      return true;
+    } catch (error) {
+      _failRequest(request, 'Could not acknowledge the new page: $error');
+      return false;
+    } finally {
+      _ackInFlightIds.remove(request.requestId);
+    }
   }
 
   void _onPageTurnRequest(Map<String, dynamic> payload) {
@@ -301,7 +357,8 @@ class PageSyncService {
 
     // Once execution starts it is the deterministic winner. Before that, every
     // state uses the lexicographically lower UUID, not arrival order.
-    final currentWins = _state.status == SyncStatus.turning ||
+    final currentWins =
+        _state.status == SyncStatus.turning ||
         current.requestId.compareTo(incoming.requestId) < 0;
     if (currentWins) {
       unawaited(_rebroadcastRequest(current));
@@ -314,6 +371,8 @@ class PageSyncService {
 
   bool _isValidIncomingRequest(PageTurnRequest request) {
     if (!_readerReady || _currentCfi != request.fromCfi) return false;
+    final age = DateTime.now().toUtc().difference(request.requestedAt);
+    if (age > _requestTimeout || age < -_maxClockSkew) return false;
     if (request.requiredUserIds.isEmpty ||
         !request.requiredUserIds.contains(request.requestedByUserId) ||
         !request.requiredUserIds.contains(_currentUserId)) {
@@ -327,12 +386,14 @@ class PageSyncService {
   }
 
   void _adoptIncomingRequest(PageTurnRequest request) {
-    _updateState(PageSyncState(
-      status: request.requestedByUserId == _currentUserId
-          ? SyncStatus.requesting
-          : SyncStatus.confirming,
-      currentRequest: request,
-    ));
+    _updateState(
+      PageSyncState(
+        status: request.requestedByUserId == _currentUserId
+            ? SyncStatus.requesting
+            : SyncStatus.confirming,
+        currentRequest: request,
+      ),
+    );
     _startTimeout(request.requestId);
     _checkConsensus(request);
   }
@@ -346,17 +407,15 @@ class PageSyncService {
     final current = _state.currentRequest;
     if (current == null ||
         current.requestId != requestId ||
-        !current.requiredUserIds.contains(userId)) {
+        !current.requiredUserIds.contains(userId) ||
+        !_isReadyReaderOnline(userId, _transport.getOnlineUsers())) {
       return;
     }
 
     final updated = current.copyWith(
       confirmedUserIds: {...current.confirmedUserIds, userId},
     );
-    _updateState(_state.copyWith(
-      currentRequest: updated,
-      clearError: true,
-    ));
+    _updateState(_state.copyWith(currentRequest: updated, clearError: true));
     _checkConsensus(updated);
   }
 
@@ -373,7 +432,13 @@ class PageSyncService {
         current == null ||
         current.requestId != requestId ||
         current.requestedByUserId != requestedByUserId ||
-        current.direction != direction) {
+        current.direction != direction ||
+        !current.isConsensusReached) {
+      return;
+    }
+
+    if (!_isRequestQuorumStillReady(current)) {
+      unawaited(_cancelRequest(current, 'required_reader_not_ready'));
       return;
     }
 
@@ -382,16 +447,18 @@ class PageSyncService {
 
   void _applyExecute(PageTurnRequest request) {
     if (_disposed || !_handledExecuteIds.add(request.requestId)) return;
-    _updateState(PageSyncState(
-      status: SyncStatus.turning,
-      currentRequest: request,
-    ));
-    onPageTurn?.call(PageTurnCommand(
-      requestId: request.requestId,
-      direction: request.direction,
-      fromCfi: request.fromCfi,
-      isRequester: request.requestedByUserId == _currentUserId,
-    ));
+    _startTimeout(request.requestId);
+    _updateState(
+      PageSyncState(status: SyncStatus.turning, currentRequest: request),
+    );
+    onPageTurn?.call(
+      PageTurnCommand(
+        requestId: request.requestId,
+        direction: request.direction,
+        fromCfi: request.fromCfi,
+        isRequester: request.requestedByUserId == _currentUserId,
+      ),
+    );
   }
 
   void _onPagePositionCommit(Map<String, dynamic> payload) {
@@ -418,21 +485,133 @@ class PageSyncService {
       return;
     }
 
-    _applyPositionCommit(PagePositionCommit(
-      requestId: requestId,
-      requestedByUserId: requestedByUserId,
-      direction: direction,
-      fromCfi: fromCfi,
-      targetCfi: targetCfi,
-    ));
+    _applyPositionCommit(
+      PagePositionCommit(
+        requestId: requestId,
+        requestedByUserId: requestedByUserId,
+        direction: direction,
+        fromCfi: fromCfi,
+        targetCfi: targetCfi,
+      ),
+    );
   }
 
   void _applyPositionCommit(PagePositionCommit commit) {
     if (_disposed || !_handledCommitIds.add(commit.requestId)) return;
+    _positionCommit = commit;
+    _positionAckUserIds.clear();
+    _startTimeout(commit.requestId);
+    _updateState(
+      PageSyncState(
+        status: SyncStatus.turning,
+        currentRequest: _state.currentRequest,
+      ),
+    );
+    onPositionCommit?.call(commit);
+  }
+
+  void _onPagePositionAck(Map<String, dynamic> payload) {
+    final requestId = payload['request_id'];
+    final userId = payload['user_id'];
+    final targetCfi = payload['target_cfi'];
+    if (requestId is! String || userId is! String || targetCfi is! String) {
+      return;
+    }
+    _applyPositionAck(
+      requestId: requestId,
+      userId: userId,
+      targetCfi: targetCfi,
+    );
+  }
+
+  void _applyPositionAck({
+    required String requestId,
+    required String userId,
+    required String targetCfi,
+  }) {
+    if (_disposed) return;
+    final request = _state.currentRequest;
+    final commit = _positionCommit;
+    if (request == null ||
+        commit == null ||
+        request.requestId != requestId ||
+        commit.requestId != requestId ||
+        commit.targetCfi != targetCfi ||
+        !request.requiredUserIds.contains(userId)) {
+      return;
+    }
+
+    _positionAckUserIds.add(userId);
+    if (request.requestedByUserId == _currentUserId &&
+        request.requiredUserIds.every(_positionAckUserIds.contains)) {
+      unawaited(_completePageTurn(request, commit));
+    }
+  }
+
+  Future<void> _completePageTurn(
+    PageTurnRequest request,
+    PagePositionCommit commit,
+  ) async {
+    if (_handledCompleteIds.contains(request.requestId) ||
+        !_completeInFlightIds.add(request.requestId)) {
+      return;
+    }
+    try {
+      await _transport.broadcast(
+        event: 'page_turn_complete',
+        payload: {
+          ...commit.toJson(),
+          'completed_by_user_id': request.requestedByUserId,
+        },
+      );
+      _applyPageTurnComplete(request, commit);
+    } catch (error) {
+      _failRequest(request, 'Could not complete the page turn: $error');
+    } finally {
+      _completeInFlightIds.remove(request.requestId);
+    }
+  }
+
+  void _onPageTurnComplete(Map<String, dynamic> payload) {
+    if (_disposed) return;
+    final requestId = payload['request_id'];
+    final requestedByUserId = payload['requested_by_user_id'];
+    final completedByUserId = payload['completed_by_user_id'];
+    final direction = pageTurnDirectionFromWire(payload['direction']);
+    final fromCfi = payload['from_cfi'];
+    final targetCfi = payload['target_cfi'];
+    final request = _state.currentRequest;
+    final commit = _positionCommit;
+
+    if (requestId is! String ||
+        requestedByUserId is! String ||
+        completedByUserId is! String ||
+        direction == null ||
+        fromCfi is! String ||
+        targetCfi is! String ||
+        request == null ||
+        commit == null ||
+        request.requestId != requestId ||
+        request.requestedByUserId != requestedByUserId ||
+        requestedByUserId != completedByUserId ||
+        request.direction != direction ||
+        request.fromCfi != fromCfi ||
+        commit.targetCfi != targetCfi) {
+      return;
+    }
+
+    _applyPageTurnComplete(request, commit);
+  }
+
+  void _applyPageTurnComplete(
+    PageTurnRequest request,
+    PagePositionCommit commit,
+  ) {
+    if (_disposed || !_handledCompleteIds.add(request.requestId)) return;
     _cancelTimeout();
     _currentCfi = commit.targetCfi;
+    _clearActivePositionState(request.requestId);
     _updateState(const PageSyncState.idle());
-    onPositionCommit?.call(commit);
   }
 
   void _onPageTurnCancel(Map<String, dynamic> payload) {
@@ -450,7 +629,7 @@ class PageSyncService {
 
     _cancelTimeout();
     final reason = payload['reason'] as String? ?? 'cancelled';
-    _setError('Page turn cancelled: $reason');
+    _failRequest(current, 'Page turn cancelled: $reason');
   }
 
   void _onPresenceChange(Map<String, dynamic> event) {
@@ -465,8 +644,11 @@ class PageSyncService {
     if (current == null) return;
 
     final onlineUsers = _transport.getOnlineUsers();
+    final isExecuting = _handledExecuteIds.contains(current.requestId);
     final remainingRequired = current.requiredUserIds.where((userId) {
-      return _isReadyReaderOnline(userId, onlineUsers);
+      return isExecuting
+          ? _isReadingParticipantOnline(userId, onlineUsers)
+          : _isReadyReaderOnline(userId, onlineUsers);
     }).toSet();
     if (remainingRequired.length == current.requiredUserIds.length) return;
     if (eventType == 'sync') {
@@ -480,10 +662,7 @@ class PageSyncService {
     }
 
     final updated = current.copyWith(requiredUserIds: remainingRequired);
-    _updateState(_state.copyWith(
-      currentRequest: updated,
-      clearError: true,
-    ));
+    _updateState(_state.copyWith(currentRequest: updated, clearError: true));
     _checkConsensus(updated);
   }
 
@@ -494,15 +673,18 @@ class PageSyncService {
         _handledExecuteIds.contains(request.requestId)) {
       return;
     }
+    if (!_isRequestQuorumStillReady(request)) {
+      unawaited(_cancelRequest(request, 'required_reader_not_ready'));
+      return;
+    }
     unawaited(_executePageTurn(request));
   }
 
   Future<void> _executePageTurn(PageTurnRequest request) async {
     if (!_executeInFlightIds.add(request.requestId)) return;
-    _updateState(PageSyncState(
-      status: SyncStatus.turning,
-      currentRequest: request,
-    ));
+    _updateState(
+      PageSyncState(status: SyncStatus.turning, currentRequest: request),
+    );
 
     try {
       await _transport.broadcast(
@@ -517,7 +699,7 @@ class PageSyncService {
       // was awaited, this is a no-op; otherwise this provides the one local run.
       _applyExecute(request);
     } catch (error) {
-      _setError('Could not execute the page turn: $error');
+      _failRequest(request, 'Could not execute the page turn: $error');
     } finally {
       _executeInFlightIds.remove(request.requestId);
     }
@@ -527,18 +709,15 @@ class PageSyncService {
     try {
       await _broadcastCancel(request, reason);
     } catch (error) {
-      _setError('Could not cancel the page turn: $error');
+      _failRequest(request, 'Could not cancel the page turn: $error');
       return;
     }
     if (_state.currentRequest?.requestId == request.requestId) {
-      _setError('Page turn cancelled: $reason');
+      _failRequest(request, 'Page turn cancelled: $reason');
     }
   }
 
-  Future<void> _broadcastCancel(
-    PageTurnRequest request,
-    String reason,
-  ) {
+  Future<void> _broadcastCancel(PageTurnRequest request, String reason) {
     return _transport.broadcast(
       event: 'page_turn_cancel',
       payload: {
@@ -612,15 +791,30 @@ class PageSyncService {
     return _ReadyReaderQuorum(readyUserIds);
   }
 
-  bool _isReadyReaderOnline(
-    String userId,
-    List<Map<String, dynamic>> users,
-  ) {
+  bool _isReadyReaderOnline(String userId, List<Map<String, dynamic>> users) {
     return users.any((user) {
       if (user['user_id'] != userId || user['is_reading'] != true) return false;
       if (userId == _currentUserId) return _readerReady;
       return user['reader_ready'] == true;
     });
+  }
+
+  bool _isReadingParticipantOnline(
+    String userId,
+    List<Map<String, dynamic>> users,
+  ) {
+    return users.any(
+      (user) => user['user_id'] == userId && user['is_reading'] == true,
+    );
+  }
+
+  bool _isRequestQuorumStillReady(PageTurnRequest request) {
+    final quorum = _buildReadyReaderQuorum();
+    return quorum.error == null &&
+        request.requiredUserIds.length == quorum.userIds.length &&
+        request.requiredUserIds.every(quorum.userIds.contains) &&
+        _readerReady &&
+        _currentCfi == request.fromCfi;
   }
 
   void _startTimeout(String requestId) {
@@ -629,7 +823,7 @@ class PageSyncService {
       if (_disposed || _state.currentRequest?.requestId != requestId) return;
       final request = _state.currentRequest!;
       unawaited(_sendTimeoutCancel(request));
-      _setError('Page turn timed out');
+      _failRequest(request, 'Page turn timed out');
     });
   }
 
@@ -651,6 +845,34 @@ class PageSyncService {
     _updateState(PageSyncState.error(message));
   }
 
+  void _failRequest(PageTurnRequest request, String message) {
+    if (_state.currentRequest?.requestId != request.requestId) return;
+    _cancelTimeout();
+    final needsRecovery =
+        _handledExecuteIds.contains(request.requestId) ||
+        _positionCommit?.requestId == request.requestId;
+    if (needsRecovery) {
+      // Once the requester has published a commit, that CFI is authoritative
+      // (and may already be persisted). Ack/complete failures must converge to
+      // it instead of rolling some readers back to the pre-turn page.
+      final recoveryCfi = _positionCommit?.requestId == request.requestId
+          ? _positionCommit!.targetCfi
+          : request.fromCfi;
+      _currentCfi = recoveryCfi;
+      onPositionRecovery?.call(recoveryCfi);
+    }
+    _clearActivePositionState(request.requestId);
+    _updateState(PageSyncState.error(message));
+  }
+
+  void _clearActivePositionState(String requestId) {
+    if (_positionCommit?.requestId == requestId) _positionCommit = null;
+    _positionAckUserIds.clear();
+    _ackInFlightIds.remove(requestId);
+    _sentAckIds.remove(requestId);
+    _completeInFlightIds.remove(requestId);
+  }
+
   void _updateState(PageSyncState newState) {
     if (_disposed) return;
     _state = newState;
@@ -669,6 +891,7 @@ class PageSyncService {
     _subscriptions.clear();
     onPageTurn = null;
     onPositionCommit = null;
+    onPositionRecovery = null;
     await _stateController.close();
   }
 }

@@ -6,10 +6,11 @@ import '../models/page_sync_state.dart';
 import '../services/page_sync_service.dart';
 import '../services/realtime_service.dart';
 
-final pageSyncProvider =
-    StateNotifierProvider<PageSyncNotifier, PageSyncState>((ref) {
-  return PageSyncNotifier();
-});
+final pageSyncProvider = StateNotifierProvider<PageSyncNotifier, PageSyncState>(
+  (ref) {
+    return PageSyncNotifier();
+  },
+);
 
 class PageSyncNotifier extends StateNotifier<PageSyncState> {
   PageSyncService? _service;
@@ -18,6 +19,7 @@ class PageSyncNotifier extends StateNotifier<PageSyncState> {
 
   void Function(PageTurnCommand command)? onPageTurn;
   void Function(PagePositionCommit commit)? onPositionCommit;
+  void Function(String targetCfi)? onPositionRecovery;
 
   PageSyncNotifier() : super(const PageSyncState.idle());
 
@@ -40,6 +42,9 @@ class PageSyncNotifier extends StateNotifier<PageSyncState> {
     _service = service;
     service.onPageTurn = (command) => onPageTurn?.call(command);
     service.onPositionCommit = (commit) => onPositionCommit?.call(commit);
+    service.onPositionRecovery = (targetCfi) {
+      onPositionRecovery?.call(targetCfi);
+    };
     service.updateReaderContext(isReady: false, currentCfi: initialCfi);
 
     _subscription = service.stateStream.listen((syncState) {
@@ -75,6 +80,10 @@ class PageSyncNotifier extends StateNotifier<PageSyncState> {
     return await _service?.commitPagePosition(targetCfi) ?? false;
   }
 
+  Future<bool> acknowledgePagePosition(String targetCfi) async {
+    return await _service?.acknowledgePagePosition(targetCfi) ?? false;
+  }
+
   Future<void> stop({bool clearCallbacks = true}) async {
     _lifecycleGeneration++;
     await _stopResources(clearCallbacks: clearCallbacks);
@@ -90,6 +99,7 @@ class PageSyncNotifier extends StateNotifier<PageSyncState> {
     if (clearCallbacks) {
       onPageTurn = null;
       onPositionCommit = null;
+      onPositionRecovery = null;
     }
     if (mounted) state = const PageSyncState.idle();
   }
@@ -103,6 +113,7 @@ class PageSyncNotifier extends StateNotifier<PageSyncState> {
     _service = null;
     onPageTurn = null;
     onPositionCommit = null;
+    onPositionRecovery = null;
     super.dispose();
   }
 }
