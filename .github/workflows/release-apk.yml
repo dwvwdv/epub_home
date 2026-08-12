@@ -43,7 +43,6 @@ jobs:
 
       - name: Run tests
         run: flutter test
-        continue-on-error: true
 
       - name: Check if keystore secrets exist
         id: check_secrets
