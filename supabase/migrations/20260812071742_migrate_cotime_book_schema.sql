@@ -3,7 +3,7 @@
 create schema if not exists cotime_book;
 
 -- Expose CoTime Book without removing schemas used by other apps.
-do $
+do $$
 declare
   configured_schemas text;
   merged_schemas text;
@@ -49,7 +49,7 @@ begin
     merged_schemas
   );
 end
-$;
+$$;
 
 drop policy if exists "Anyone can read active rooms" on public.rooms;
 drop policy if exists "Authenticated users can create rooms" on public.rooms;

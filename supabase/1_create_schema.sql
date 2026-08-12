@@ -6,7 +6,7 @@ grant usage on schema cotime_book to authenticated, service_role;
 revoke usage on schema cotime_book from anon;
 
 -- Expose CoTime Book without removing schemas used by other apps.
-do $
+do $$
 declare
   configured_schemas text;
   merged_schemas text;
@@ -52,6 +52,6 @@ begin
     merged_schemas
   );
 end
-$;
+$$;
 
 notify pgrst, 'reload config';

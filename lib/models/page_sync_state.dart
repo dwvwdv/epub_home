@@ -1,5 +1,17 @@
 enum PageTurnDirection { next, previous }
 
+String pageTurnDirectionToWire(PageTurnDirection direction) {
+  return direction == PageTurnDirection.next ? 'next' : 'previous';
+}
+
+PageTurnDirection? pageTurnDirectionFromWire(Object? value) {
+  return switch (value) {
+    'next' => PageTurnDirection.next,
+    'previous' => PageTurnDirection.previous,
+    _ => null,
+  };
+}
+
 enum SyncStatus {
   idle,
   requesting,
@@ -9,21 +21,23 @@ enum SyncStatus {
 }
 
 class PageTurnRequest {
+  final String sessionId;
   final String requestId;
   final String requestedByUserId;
   final String requestedByNickname;
   final PageTurnDirection direction;
-  final String? fromCfi;
+  final String fromCfi;
   final DateTime requestedAt;
   final Set<String> confirmedUserIds;
   final Set<String> requiredUserIds;
 
   const PageTurnRequest({
+    required this.sessionId,
     required this.requestId,
     required this.requestedByUserId,
     required this.requestedByNickname,
     required this.direction,
-    this.fromCfi,
+    required this.fromCfi,
     required this.requestedAt,
     required this.confirmedUserIds,
     required this.requiredUserIds,
@@ -31,19 +45,24 @@ class PageTurnRequest {
 
   bool get isConsensusReached =>
       requiredUserIds.isNotEmpty &&
-      requiredUserIds.every((id) => confirmedUserIds.contains(id));
+      requiredUserIds.every(confirmedUserIds.contains);
 
   Set<String> get pendingUserIds =>
       requiredUserIds.difference(confirmedUserIds);
 
-  double get progress =>
-      requiredUserIds.isEmpty ? 0 : confirmedUserIds.length / requiredUserIds.length;
+  int get validConfirmationCount =>
+      confirmedUserIds.intersection(requiredUserIds).length;
+
+  double get progress => requiredUserIds.isEmpty
+      ? 0
+      : validConfirmationCount / requiredUserIds.length;
 
   PageTurnRequest copyWith({
     Set<String>? confirmedUserIds,
     Set<String>? requiredUserIds,
   }) {
     return PageTurnRequest(
+      sessionId: sessionId,
       requestId: requestId,
       requestedByUserId: requestedByUserId,
       requestedByNickname: requestedByNickname,
@@ -57,53 +76,146 @@ class PageTurnRequest {
 
   Map<String, dynamic> toJson() {
     return {
+      'session_id': sessionId,
       'request_id': requestId,
       'user_id': requestedByUserId,
       'nickname': requestedByNickname,
-      'direction': direction == PageTurnDirection.next ? 'next' : 'previous',
+      'direction': pageTurnDirectionToWire(direction),
       'from_cfi': fromCfi,
-      'required_users': requiredUserIds.toList(),
+      'requested_at': requestedAt.toUtc().toIso8601String(),
+      'required_users': requiredUserIds.toList()..sort(),
     };
   }
 
   factory PageTurnRequest.fromJson(Map<String, dynamic> json) {
+    final direction = pageTurnDirectionFromWire(json['direction']);
+    if (direction == null) {
+      throw const FormatException('Invalid page turn direction');
+    }
+
+    final sessionId = json['session_id'];
+    final requestId = json['request_id'];
+    final requestedByUserId = json['user_id'];
+    final fromCfi = json['from_cfi'];
+    final rawRequestedAt = json['requested_at'];
+    final requestedAt = rawRequestedAt is String
+        ? DateTime.tryParse(rawRequestedAt)
+        : null;
+    if (sessionId is! String ||
+        sessionId.isEmpty ||
+        requestId is! String ||
+        requestId.isEmpty ||
+        requestedByUserId is! String ||
+        requestedByUserId.isEmpty ||
+        fromCfi is! String ||
+        fromCfi.isEmpty ||
+        requestedAt == null) {
+      throw const FormatException('Invalid page turn request');
+    }
+
+    final rawRequiredUsers = json['required_users'];
+    if (rawRequiredUsers is! List) {
+      throw const FormatException('Invalid required users');
+    }
+
+    final requiredUserIds = rawRequiredUsers.whereType<String>().toSet();
+    if (requiredUserIds.length != rawRequiredUsers.length ||
+        !requiredUserIds.contains(requestedByUserId)) {
+      throw const FormatException('Invalid required users');
+    }
+
     return PageTurnRequest(
-      requestId: json['request_id'] as String,
-      requestedByUserId: json['user_id'] as String,
-      requestedByNickname: json['nickname'] as String? ?? 'Unknown',
-      direction: json['direction'] == 'next'
-          ? PageTurnDirection.next
-          : PageTurnDirection.previous,
-      fromCfi: json['from_cfi'] as String?,
-      requestedAt: DateTime.now(),
-      confirmedUserIds: {json['user_id'] as String},
-      requiredUserIds: Set<String>.from(
-        (json['required_users'] as List<dynamic>?)?.cast<String>() ?? [],
-      ),
+      sessionId: sessionId,
+      requestId: requestId,
+      requestedByUserId: requestedByUserId,
+      requestedByNickname: json['nickname'] is String
+          ? json['nickname'] as String
+          : 'Unknown',
+      direction: direction,
+      fromCfi: fromCfi,
+      requestedAt: requestedAt,
+      confirmedUserIds: {requestedByUserId},
+      requiredUserIds: requiredUserIds,
     );
+  }
+}
+
+class PageTurnCommand {
+  final String requestId;
+  final PageTurnDirection direction;
+  final String fromCfi;
+  final bool isRequester;
+
+  const PageTurnCommand({
+    required this.requestId,
+    required this.direction,
+    required this.fromCfi,
+    required this.isRequester,
+  });
+}
+
+class PagePositionCommit {
+  final String requestId;
+  final String requestedByUserId;
+  final PageTurnDirection direction;
+  final String fromCfi;
+  final String targetCfi;
+
+  const PagePositionCommit({
+    required this.requestId,
+    required this.requestedByUserId,
+    required this.direction,
+    required this.fromCfi,
+    required this.targetCfi,
+  });
+
+  Map<String, dynamic> toJson() {
+    return {
+      'request_id': requestId,
+      'requested_by_user_id': requestedByUserId,
+      'direction': pageTurnDirectionToWire(direction),
+      'from_cfi': fromCfi,
+      'target_cfi': targetCfi,
+    };
   }
 }
 
 class PageSyncState {
   final SyncStatus status;
   final PageTurnRequest? currentRequest;
+  final String? errorMessage;
 
   const PageSyncState({
     this.status = SyncStatus.idle,
     this.currentRequest,
+    this.errorMessage,
   });
 
   const PageSyncState.idle()
       : status = SyncStatus.idle,
-        currentRequest = null;
+        currentRequest = null,
+        errorMessage = null;
+
+  const PageSyncState.error(String message)
+      : status = SyncStatus.idle,
+        currentRequest = null,
+        errorMessage = message;
+
+  int get validConfirmationCount =>
+      currentRequest?.validConfirmationCount ?? 0;
 
   PageSyncState copyWith({
     SyncStatus? status,
     PageTurnRequest? currentRequest,
+    String? errorMessage,
+    bool clearCurrentRequest = false,
+    bool clearError = false,
   }) {
     return PageSyncState(
       status: status ?? this.status,
-      currentRequest: currentRequest ?? this.currentRequest,
+      currentRequest:
+          clearCurrentRequest ? null : currentRequest ?? this.currentRequest,
+      errorMessage: clearError ? null : errorMessage ?? this.errorMessage,
     );
   }
 }

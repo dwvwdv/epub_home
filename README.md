@@ -24,6 +24,34 @@ This Supabase project is shared by multiple apps. CoTime Book channels are alrea
 private and protected by Realtime RLS. Do not change the project-wide **Allow public
 access to channels** setting unless every app sharing the project has been audited.
 
+### Room lifecycle maintenance
+
+Room membership is changed only through the `create_room`, `join_room`, and
+`leave_room` RPCs. Active clients should call `heartbeat_room` periodically; a
+heartbeat extends the room lease for 24 hours. The app sends one every five minutes
+while it is in the foreground. A member is stale after 30 minutes without a
+heartbeat. Existing rooms and memberships receive one 24-hour grace window when
+the migration is first applied, so deployed legacy clients are not evicted
+immediately. Do not restore direct `DELETE` access on `cotime_book.room_members`,
+because the RPC serializes concurrent leaves, stale-member eviction, and host
+transfer on the parent room row.
+
+The lifecycle maintenance function stays in the unexposed private schema and is
+owned and invoked by the database Cron worker:
+
+```sql
+select cotime_book_private.cleanup_expired_rooms();
+```
+
+The migration enables Supabase Cron (`pg_cron`) and idempotently installs the
+`cotime_book-room-lifecycle` job to run every ten minutes. The cleanup evicts stale
+members, transfers the host to the earliest live member, closes empty or expired
+rooms, hard-deletes rooms 30 days after closure, and permanently retains their
+six-character codes in `cotime_book_private.room_code_reservations`.
+
+Database lifecycle tests live in `supabase/tests/database/room_lifecycle.test.sql` and
+run with `supabase test db` after applying migrations to a local Supabase database.
+
 This will create:
 - `rooms` - Stores reading rooms
 - `room_members` - Tracks who is in each room

@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_epub_viewer/flutter_epub_viewer.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -10,6 +12,7 @@ import '../providers/page_sync_provider.dart';
 import '../providers/presence_provider.dart';
 import '../providers/reading_preferences_provider.dart';
 import '../providers/room_provider.dart';
+import '../services/room_service.dart';
 import '../widgets/sync_status_bar.dart';
 
 class ReaderScreen extends ConsumerStatefulWidget {
@@ -25,6 +28,15 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
   EpubController? _epubController;
   String? _currentCfi;
   bool _isReaderReady = false;
+  bool _isStoppingPageSync = false;
+  PageTurnCommand? _queuedTurnCommand;
+  PageTurnCommand? _awaitingTurnRelocation;
+  String? _awaitingTurnRoomId;
+  String? _queuedTargetCfi;
+  String? _displayingTargetCfi;
+  bool _recoveringAuthoritativePosition = false;
+  int _positionRecoveryGeneration = 0;
+  Future<void> _cfiWriteChain = Future<void>.value();
 
   // Track key so we can rebuild the viewer when theme changes.
   int _viewerKey = 0;
@@ -45,44 +57,306 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
     final realtimeService = ref.read(realtimeServiceProvider);
 
     if (!authState.isAuthenticated) return;
-
-    // Set page turn callback
-    ref.read(pageSyncProvider.notifier).initialize(
-          realtimeService: realtimeService,
-          currentUserId: authState.userId!,
-          currentNickname: authState.nickname,
+    final roomState = ref.read(roomProvider);
+    final readingSessionId = roomState.readingSessionId;
+    final participantUserIds = roomState.readingParticipantUserIds;
+    if (readingSessionId == null ||
+        participantUserIds.isEmpty ||
+        !participantUserIds.contains(authState.userId)) {
+      if (mounted) {
+        context.goNamed(
+          'lobby',
+          pathParameters: {'roomCode': widget.roomCode},
         );
-
-    ref.read(pageSyncProvider.notifier).onPageTurn = (direction) {
-      if (_epubController != null && _isReaderReady) {
-        if (direction == PageTurnDirection.next) {
-          _epubController!.next();
-        } else {
-          _epubController!.prev();
-        }
       }
-    };
+      return;
+    }
+
+    // Entering the route means "reading", but the client must remain outside
+    // the page-turn quorum until the EPUB controller has loaded its chapters.
+    final presence = ref.read(presenceProvider.notifier);
+    await presence.updateReaderReady(false);
+    if (!mounted || _isStoppingPageSync) return;
+    await presence.updateIsReading(true);
+    if (!mounted || _isStoppingPageSync) return;
+
+    final pageSync = ref.read(pageSyncProvider.notifier);
+    pageSync.onPageTurn = _handlePageTurn;
+    pageSync.onPositionCommit = _handlePositionCommit;
+    pageSync.onPositionRecovery = _handlePositionRecovery;
+    await pageSync.initialize(
+      realtimeService: realtimeService,
+      currentUserId: authState.userId!,
+      currentNickname: authState.nickname,
+      readingSessionId: readingSessionId,
+      expectedParticipantUserIds: participantUserIds,
+      initialCfi: _currentCfi,
+    );
+    if (!mounted || _isStoppingPageSync) return;
 
     // Fetch the latest room CFI from DB (in case other users advanced the page
     // while this user was away).  If it differs from cached, force viewer reload.
     await ref.read(roomProvider.notifier).refreshRoom();
+    if (!mounted || _isStoppingPageSync) return;
     final freshRoom = ref.read(roomProvider).currentRoom;
     final freshCfi = freshRoom?.currentCfi;
-    if (freshCfi != null && freshCfi != _currentCfi) {
-      setState(() {
-        _currentCfi = freshCfi;
-        _viewerKey++; // rebuild EpubViewer with the updated initialCfi
-      });
+    if (freshCfi != null && freshCfi != _currentCfi && mounted) {
+      _currentCfi = freshCfi;
+      _rebuildViewer();
     }
-
-    // Mark this user as currently reading in presence.
-    await ref.read(presenceProvider.notifier).updateIsReading(true);
+    pageSync.updateReaderContext(
+      isReady: _isReaderReady,
+      currentCfi: _currentCfi,
+    );
+    await presence.updateReaderReady(_isReaderReady);
   }
 
   @override
   void dispose() {
+    _isStoppingPageSync = true;
+    ++_positionRecoveryGeneration;
+    final pageSync = ref.read(pageSyncProvider.notifier);
+    pageSync.updateReaderContext(isReady: false, currentCfi: _currentCfi);
+    unawaited(() async {
+      try {
+        await pageSync.leaveReadingSession();
+      } catch (_) {
+        // Route disposal cannot surface an unhandled Realtime send failure.
+      } finally {
+        await pageSync.stop();
+      }
+    }());
+    final presence = ref.read(presenceProvider.notifier);
+    unawaited(() async {
+      // Preserve track ordering during route disposal so a slower
+      // reader_ready=false update cannot overwrite the final lobby state.
+      await presence.updateReaderReady(false);
+      await presence.updateIsReading(false);
+    }());
     _epubController = null;
     super.dispose();
+  }
+
+  void _handlePageTurn(PageTurnCommand command) {
+    if (!mounted || _isStoppingPageSync) return;
+    if (!_isReaderReady || _epubController == null) {
+      _queuedTurnCommand = command;
+      return;
+    }
+    _executePageTurn(command);
+  }
+
+  void _executePageTurn(PageTurnCommand command) {
+    final controller = _epubController;
+    if (controller == null || !_isReaderReady) {
+      _queuedTurnCommand = command;
+      return;
+    }
+
+    _queuedTurnCommand = null;
+    _awaitingTurnRelocation = command;
+    _awaitingTurnRoomId = ref.read(roomProvider).currentRoom?.id;
+    if (command.direction == PageTurnDirection.next) {
+      controller.next();
+    } else {
+      controller.prev();
+    }
+  }
+
+  void _handlePositionCommit(PagePositionCommit commit) {
+    if (!mounted || _isStoppingPageSync) return;
+    _queuedTurnCommand = null;
+    _awaitingTurnRelocation = null;
+    _awaitingTurnRoomId = null;
+    ref.read(bookProvider.notifier).updateCfi(commit.targetCfi);
+
+    if (!_isReaderReady || _epubController == null) {
+      _queuedTargetCfi = commit.targetCfi;
+      return;
+    }
+    _displayCommittedPosition(commit.targetCfi);
+  }
+
+  void _handlePositionRecovery(
+    String targetCfi,
+    bool positionWasCommitted,
+  ) {
+    if (!mounted || _isStoppingPageSync) return;
+    _queuedTurnCommand = null;
+    _awaitingTurnRelocation = null;
+    _awaitingTurnRoomId = null;
+    _displayingTargetCfi = null;
+
+    if (!positionWasCommitted) {
+      final roomId = ref.read(roomProvider).currentRoom?.id;
+      if (roomId != null) {
+        final recoveryGeneration = ++_positionRecoveryGeneration;
+        setState(() => _recoveringAuthoritativePosition = true);
+        ref
+            .read(pageSyncProvider.notifier)
+            .updateReaderContext(isReady: false, currentCfi: _currentCfi);
+        unawaited(
+          ref.read(presenceProvider.notifier).updateReaderReady(false),
+        );
+        unawaited(
+          _recoverAuthoritativePosition(
+            fallbackCfi: targetCfi,
+            roomId: roomId,
+            recoveryGeneration: recoveryGeneration,
+          ),
+        );
+        return;
+      }
+    }
+
+    ref.read(bookProvider.notifier).updateCfi(targetCfi);
+
+    if (!_isReaderReady || _epubController == null) {
+      _queuedTargetCfi = targetCfi;
+      return;
+    }
+    _displayCommittedPosition(targetCfi);
+  }
+
+  Future<void> _recoverAuthoritativePosition({
+    required String fallbackCfi,
+    required String roomId,
+    required int recoveryGeneration,
+  }) async {
+    String? authoritativeCfi;
+    final roomNotifier = ref.read(roomProvider.notifier);
+
+    while (mounted &&
+        !_isStoppingPageSync &&
+        recoveryGeneration == _positionRecoveryGeneration &&
+        ref.read(roomProvider).currentRoom?.id == roomId) {
+      final cachedCfi = ref.read(roomProvider).currentRoom?.currentCfi;
+      // The requester already received the authoritative row from its
+      // successful write even when the following Realtime commit failed.
+      if (cachedCfi != null && cachedCfi != fallbackCfi) {
+        authoritativeCfi = cachedCfi;
+        break;
+      }
+
+      final refreshedRoom = await roomNotifier.refreshRoomAndGet();
+      if (refreshedRoom != null) {
+        authoritativeCfi = refreshedRoom.currentCfi ?? fallbackCfi;
+        break;
+      }
+      await Future<void>.delayed(const Duration(seconds: 2));
+    }
+
+    if (!mounted ||
+        _isStoppingPageSync ||
+        recoveryGeneration != _positionRecoveryGeneration ||
+        ref.read(roomProvider).currentRoom?.id != roomId) {
+      return;
+    }
+
+    final targetCfi = authoritativeCfi ?? fallbackCfi;
+    ref.read(bookProvider.notifier).updateCfi(targetCfi);
+    setState(() => _recoveringAuthoritativePosition = false);
+    if (_currentCfi != targetCfi) {
+      _displayCommittedPosition(targetCfi);
+      return;
+    }
+
+    ref
+        .read(pageSyncProvider.notifier)
+        .updateReaderContext(isReady: _isReaderReady, currentCfi: targetCfi);
+    try {
+      await ref
+          .read(presenceProvider.notifier)
+          .updateReaderReady(_isReaderReady);
+    } catch (_) {
+      // The cached Presence intent remains authoritative locally and will be
+      // retried by the connection lifecycle after transport recovery.
+    }
+  }
+
+  void _displayCommittedPosition(String targetCfi) {
+    _queuedTargetCfi = null;
+    if (_currentCfi == targetCfi) {
+      unawaited(
+        ref.read(pageSyncProvider.notifier).acknowledgePagePosition(targetCfi),
+      );
+      return;
+    }
+    _displayingTargetCfi = targetCfi;
+    ref.read(pageSyncProvider.notifier).updateReaderContext(isReady: false);
+    unawaited(ref.read(presenceProvider.notifier).updateReaderReady(false));
+    _epubController?.display(cfi: targetCfi);
+  }
+
+  void _rebuildViewer() {
+    if (_isStoppingPageSync ||
+        ref.read(pageSyncProvider).currentRequest != null) {
+      return;
+    }
+    _isReaderReady = false;
+    ref
+        .read(pageSyncProvider.notifier)
+        .updateReaderContext(isReady: false, currentCfi: _currentCfi);
+    unawaited(ref.read(presenceProvider.notifier).updateReaderReady(false));
+    setState(() => _viewerKey++);
+  }
+
+  Future<void> _commitRequesterPosition(
+    PageTurnCommand command,
+    String targetCfi,
+    String roomId,
+  ) async {
+    if (!command.isRequester || _isStoppingPageSync) return;
+    // The requester is the sole database writer. Do not publish the Realtime
+    // commit until its CFI is durable; followers therefore never advance to a
+    // position that a later join cannot load from the database.
+    final roomNotifier = ref.read(roomProvider.notifier);
+    _cfiWriteChain = _cfiWriteChain.then((_) async {
+      while (mounted &&
+          !_isStoppingPageSync &&
+          ref.read(pageSyncProvider.notifier).isRequestActive(command.requestId)) {
+        try {
+          final pageSync = ref.read(pageSyncProvider.notifier);
+          if (!await pageSync.beginPositionPersistence(command.requestId)) {
+            return;
+          }
+          await roomNotifier.updateCfiForRoom(roomId: roomId, cfi: targetCfi);
+          if (!mounted ||
+              _isStoppingPageSync ||
+              !ref
+                  .read(pageSyncProvider.notifier)
+                  .isRequestActive(command.requestId)) {
+            return;
+          }
+          final committed = await pageSync.commitPagePosition(targetCfi);
+          if (committed) {
+            await pageSync.acknowledgePagePosition(targetCfi);
+            return;
+          }
+          await Future<void>.delayed(const Duration(seconds: 2));
+        } on RoomSessionChangedException {
+          if (!mounted ||
+              _isStoppingPageSync ||
+              ref.read(roomProvider).currentRoom?.id != roomId ||
+              !ref
+                  .read(pageSyncProvider.notifier)
+                  .isRequestActive(command.requestId)) {
+            return;
+          }
+          await roomNotifier.refreshRoom();
+          await Future<void>.delayed(const Duration(seconds: 2));
+        } catch (error) {
+          ref
+              .read(pageSyncProvider.notifier)
+              .reportPositionPersistenceFailure(
+                requestId: command.requestId,
+                error: error,
+              );
+          await Future<void>.delayed(const Duration(seconds: 2));
+        }
+      }
+    });
+    await _cfiWriteChain;
   }
 
   @override
@@ -114,10 +388,12 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
               SyncStatusBar(
                 syncState: syncState,
                 onlineUsers: presenceState.onlineUsers,
-                onConfirm: () =>
-                    ref.read(pageSyncProvider.notifier).confirmPageTurn(),
-                onDecline: () =>
-                    ref.read(pageSyncProvider.notifier).declinePageTurn(),
+                onConfirm: () => unawaited(
+                  ref.read(pageSyncProvider.notifier).confirmPageTurn(),
+                ),
+                onDecline: () => unawaited(
+                  ref.read(pageSyncProvider.notifier).declinePageTurn(),
+                ),
               ),
 
               // EPUB reader with gesture overlay
@@ -125,52 +401,130 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
                 child: Stack(
                   children: [
                     // Layer 1: EPUB viewer
-                    EpubViewer(
-                      key: ValueKey(_viewerKey),
-                      epubController: _epubController!,
-                      epubSource: EpubSource.fromFile(bookState.bookFile!),
-                      displaySettings: EpubDisplaySettings(
-                        flow: EpubFlow.paginated,
-                        snap: true,
+                    AbsorbPointer(
+                      absorbing: true,
+                      child: EpubViewer(
+                        key: ValueKey(_viewerKey),
+                        epubController: _epubController!,
+                        epubSource: EpubSource.fromFile(bookState.bookFile!),
+                        displaySettings: EpubDisplaySettings(
+                          flow: EpubFlow.paginated,
+                          snap: false,
+                          // flutter_epub_viewer 1.2.x otherwise installs its
+                          // own Android detectSwipe() handler even when snap
+                          // is false, bypassing the consensus overlay.
+                          useSnapAnimationAndroid: true,
+                        ),
+                        initialCfi: _currentCfi,
+                        onChaptersLoaded: (chapters) {
+                          if (!mounted || _isStoppingPageSync) return;
+                          setState(() => _isReaderReady = true);
+                          ref
+                              .read(pageSyncProvider.notifier)
+                              .updateReaderContext(
+                                isReady: true,
+                                currentCfi: _currentCfi,
+                              );
+                          unawaited(
+                            ref
+                                .read(presenceProvider.notifier)
+                                .updateReaderReady(true),
+                          );
+
+                          final targetCfi = _queuedTargetCfi;
+                          if (targetCfi != null) {
+                            _displayCommittedPosition(targetCfi);
+                            return;
+                          }
+                          final queuedTurn = _queuedTurnCommand;
+                          if (queuedTurn != null) _executePageTurn(queuedTurn);
+                        },
+                        onRelocated: (location) {
+                          if (!mounted || _isStoppingPageSync) return;
+                          final committedTarget = _displayingTargetCfi;
+                          final relocatedCfi =
+                              committedTarget ?? location.startCfi;
+                          _currentCfi = relocatedCfi;
+                          if (committedTarget != null) {
+                            setState(() => _displayingTargetCfi = null);
+                          }
+                          ref
+                              .read(bookProvider.notifier)
+                              .updateCfi(relocatedCfi);
+                          ref
+                              .read(pageSyncProvider.notifier)
+                              .updateReaderContext(
+                                isReady:
+                                    _isReaderReady &&
+                                    _displayingTargetCfi == null,
+                                currentCfi: relocatedCfi,
+                              );
+                          if (_displayingTargetCfi == null) {
+                            unawaited(
+                              ref
+                                  .read(presenceProvider.notifier)
+                                  .updateReaderReady(true),
+                            );
+                          }
+
+                          if (committedTarget != null) {
+                            unawaited(
+                              ref
+                                  .read(pageSyncProvider.notifier)
+                                  .acknowledgePagePosition(relocatedCfi),
+                            );
+                          }
+
+                          final command = _awaitingTurnRelocation;
+                          final roomId = _awaitingTurnRoomId;
+                          if (command != null) {
+                            _awaitingTurnRelocation = null;
+                            _awaitingTurnRoomId = null;
+                            if (roomId != null) {
+                              unawaited(
+                                _commitRequesterPosition(
+                                  command,
+                                  relocatedCfi,
+                                  roomId,
+                                ),
+                              );
+                            }
+                          }
+                        },
                       ),
-                      initialCfi: _currentCfi,
-                      onChaptersLoaded: (chapters) {
-                        setState(() => _isReaderReady = true);
-                      },
-                      onRelocated: (location) {
-                        _currentCfi = location.startCfi;
-                        ref
-                            .read(bookProvider.notifier)
-                            .updateCfi(location.startCfi);
-                        ref
-                            .read(roomProvider.notifier)
-                            .updateCfi(location.startCfi);
-                      },
                     ),
 
                     // Layer 2: Gesture interceptor overlay
                     if (_isReaderReady)
                       Positioned.fill(
                         child: GestureDetector(
-                          behavior: HitTestBehavior.translucent,
+                          behavior: HitTestBehavior.opaque,
                           onHorizontalDragEnd: (details) {
-                            if (syncState.status != SyncStatus.idle) return;
+                            if (syncState.status != SyncStatus.idle ||
+                                _recoveringAuthoritativePosition ||
+                                _displayingTargetCfi != null) {
+                              return;
+                            }
                             if (details.primaryVelocity == null) return;
 
                             if (details.primaryVelocity! < -200) {
-                              ref
-                                  .read(pageSyncProvider.notifier)
-                                  .requestPageTurn(
-                                    direction: PageTurnDirection.next,
-                                    fromCfi: _currentCfi,
-                                  );
+                              unawaited(
+                                ref
+                                    .read(pageSyncProvider.notifier)
+                                    .requestPageTurn(
+                                      direction: PageTurnDirection.next,
+                                      fromCfi: _currentCfi,
+                                    ),
+                              );
                             } else if (details.primaryVelocity! > 200) {
-                              ref
-                                  .read(pageSyncProvider.notifier)
-                                  .requestPageTurn(
-                                    direction: PageTurnDirection.previous,
-                                    fromCfi: _currentCfi,
-                                  );
+                              unawaited(
+                                ref
+                                    .read(pageSyncProvider.notifier)
+                                    .requestPageTurn(
+                                      direction: PageTurnDirection.previous,
+                                      fromCfi: _currentCfi,
+                                    ),
+                              );
                             }
                           },
                         ),
@@ -189,7 +543,11 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
   }
 
   Widget _buildBottomBar(PageSyncState syncState) {
-    final isIdle = syncState.status == SyncStatus.idle;
+    final isIdle =
+        syncState.status == SyncStatus.idle &&
+        _isReaderReady &&
+        !_recoveringAuthoritativePosition &&
+        _displayingTargetCfi == null;
 
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
@@ -199,7 +557,7 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
           // Leave button
           IconButton(
             icon: const Icon(Icons.arrow_back),
-            onPressed: _leaveReader,
+            onPressed: syncState.currentRequest == null ? _leaveReader : null,
             tooltip: 'Leave reading',
           ),
 
@@ -209,10 +567,14 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
           IconButton(
             icon: const Icon(Icons.chevron_left, size: 32),
             onPressed: isIdle
-                ? () => ref.read(pageSyncProvider.notifier).requestPageTurn(
-                      direction: PageTurnDirection.previous,
-                      fromCfi: _currentCfi,
-                    )
+                ? () => unawaited(
+                    ref
+                        .read(pageSyncProvider.notifier)
+                        .requestPageTurn(
+                          direction: PageTurnDirection.previous,
+                          fromCfi: _currentCfi,
+                        ),
+                  )
                 : null,
           ),
 
@@ -222,10 +584,14 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
           IconButton(
             icon: const Icon(Icons.chevron_right, size: 32),
             onPressed: isIdle
-                ? () => ref.read(pageSyncProvider.notifier).requestPageTurn(
-                      direction: PageTurnDirection.next,
-                      fromCfi: _currentCfi,
-                    )
+                ? () => unawaited(
+                    ref
+                        .read(pageSyncProvider.notifier)
+                        .requestPageTurn(
+                          direction: PageTurnDirection.next,
+                          fromCfi: _currentCfi,
+                        ),
+                  )
                 : null,
           ),
 
@@ -234,7 +600,13 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
           // Theme / color settings button (Feature 1)
           IconButton(
             icon: const Icon(Icons.palette_outlined),
-            onPressed: _showThemeSettings,
+            onPressed:
+                syncState.status == SyncStatus.idle &&
+                    syncState.currentRequest == null &&
+                    _isReaderReady &&
+                    !_isStoppingPageSync
+                ? _showThemeSettings
+                : null,
             tooltip: 'Reading theme',
           ),
 
@@ -281,10 +653,14 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
                   textColor: Colors.black87,
                   isSelected: prefs.theme == ReadingTheme.day,
                   onTap: () {
+                    if (ref.read(pageSyncProvider).currentRequest != null) {
+                      Navigator.pop(ctx);
+                      return;
+                    }
                     ref
                         .read(readingPreferencesProvider.notifier)
                         .setTheme(ReadingTheme.day);
-                    setState(() => _viewerKey++);
+                    _rebuildViewer();
                     Navigator.pop(ctx);
                   },
                 ),
@@ -294,10 +670,14 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
                   textColor: const Color(0xFF4A3728),
                   isSelected: prefs.theme == ReadingTheme.sepia,
                   onTap: () {
+                    if (ref.read(pageSyncProvider).currentRequest != null) {
+                      Navigator.pop(ctx);
+                      return;
+                    }
                     ref
                         .read(readingPreferencesProvider.notifier)
                         .setTheme(ReadingTheme.sepia);
-                    setState(() => _viewerKey++);
+                    _rebuildViewer();
                     Navigator.pop(ctx);
                   },
                 ),
@@ -307,10 +687,14 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
                   textColor: const Color(0xFFE0E0E0),
                   isSelected: prefs.theme == ReadingTheme.night,
                   onTap: () {
+                    if (ref.read(pageSyncProvider).currentRequest != null) {
+                      Navigator.pop(ctx);
+                      return;
+                    }
                     ref
                         .read(readingPreferencesProvider.notifier)
                         .setTheme(ReadingTheme.night);
-                    setState(() => _viewerKey++);
+                    _rebuildViewer();
                     Navigator.pop(ctx);
                   },
                 ),
@@ -340,10 +724,7 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
           children: [
             Text(
               '${presenceState.onlineCount} Members Online',
-              style: const TextStyle(
-                fontSize: 18,
-                fontWeight: FontWeight.bold,
-              ),
+              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 16),
             ...presenceState.onlineUsers.map((user) {
@@ -390,10 +771,41 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
 
   Future<void> _leaveReader() async {
     // Feature 3: Mark this user as no longer reading.
-    await ref.read(presenceProvider.notifier).updateIsReading(false);
+    if (_isStoppingPageSync) return;
+    if (ref.read(pageSyncProvider).currentRequest != null) {
+      _showSyncError('Wait for the current synchronized page turn to finish.');
+      return;
+    }
+    _isStoppingPageSync = true;
+    final pageSync = ref.read(pageSyncProvider.notifier);
+    pageSync.updateReaderContext(isReady: false, currentCfi: _currentCfi);
+    final presence = ref.read(presenceProvider.notifier);
+    try {
+      await pageSync.leaveReadingSession();
+    } catch (_) {
+      // Presence state still marks this reader as leaving below.
+    }
+    try {
+      await pageSync.stop();
+    } catch (_) {
+      // Local navigation must not be held hostage by a stale subscription.
+    }
+    try {
+      await presence.updateReaderReady(false);
+      await presence.updateIsReading(false);
+    } catch (_) {
+      // Presence reconciliation/room cleanup handles disconnected exits.
+    }
     if (mounted) {
       context.goNamed('lobby', pathParameters: {'roomCode': widget.roomCode});
     }
+  }
+
+  void _showSyncError(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
   }
 }
 

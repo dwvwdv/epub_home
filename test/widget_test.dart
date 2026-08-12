@@ -7,10 +7,12 @@ void main() {
   group('PageTurnRequest', () {
     test('isConsensusReached returns true when all users confirmed', () {
       final request = PageTurnRequest(
+        sessionId: 'session-1',
         requestId: 'test-1',
         requestedByUserId: 'user-a',
         requestedByNickname: 'Alice',
         direction: PageTurnDirection.next,
+        fromCfi: 'epubcfi(/6/2)',
         requestedAt: DateTime.now(),
         confirmedUserIds: {'user-a', 'user-b', 'user-c'},
         requiredUserIds: {'user-a', 'user-b', 'user-c'},
@@ -23,10 +25,12 @@ void main() {
 
     test('isConsensusReached returns false when not all confirmed', () {
       final request = PageTurnRequest(
+        sessionId: 'session-1',
         requestId: 'test-2',
         requestedByUserId: 'user-a',
         requestedByNickname: 'Alice',
         direction: PageTurnDirection.next,
+        fromCfi: 'epubcfi(/6/2)',
         requestedAt: DateTime.now(),
         confirmedUserIds: {'user-a'},
         requiredUserIds: {'user-a', 'user-b', 'user-c'},
@@ -39,10 +43,12 @@ void main() {
 
     test('handles removing disconnected users', () {
       final request = PageTurnRequest(
+        sessionId: 'session-1',
         requestId: 'test-3',
         requestedByUserId: 'user-a',
         requestedByNickname: 'Alice',
         direction: PageTurnDirection.next,
+        fromCfi: 'epubcfi(/6/2)',
         requestedAt: DateTime.now(),
         confirmedUserIds: {'user-a'},
         requiredUserIds: {'user-a', 'user-b', 'user-c'},
@@ -64,6 +70,7 @@ void main() {
 
     test('serialization roundtrip', () {
       final original = PageTurnRequest(
+        sessionId: 'session-1',
         requestId: 'test-4',
         requestedByUserId: 'user-a',
         requestedByNickname: 'Alice',
@@ -77,6 +84,7 @@ void main() {
       final json = original.toJson();
       final restored = PageTurnRequest.fromJson(json);
 
+      expect(restored.sessionId, original.sessionId);
       expect(restored.requestId, original.requestId);
       expect(restored.direction, original.direction);
       expect(restored.fromCfi, original.fromCfi);
