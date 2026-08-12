@@ -19,7 +19,8 @@ class PageSyncNotifier extends StateNotifier<PageSyncState> {
 
   void Function(PageTurnCommand command)? onPageTurn;
   void Function(PagePositionCommit commit)? onPositionCommit;
-  void Function(String targetCfi)? onPositionRecovery;
+  void Function(String targetCfi, bool positionWasCommitted)?
+      onPositionRecovery;
 
   PageSyncNotifier() : super(const PageSyncState.idle());
 
@@ -46,8 +47,8 @@ class PageSyncNotifier extends StateNotifier<PageSyncState> {
     _service = service;
     service.onPageTurn = (command) => onPageTurn?.call(command);
     service.onPositionCommit = (commit) => onPositionCommit?.call(commit);
-    service.onPositionRecovery = (targetCfi) {
-      onPositionRecovery?.call(targetCfi);
+    service.onPositionRecovery = (targetCfi, positionWasCommitted) {
+      onPositionRecovery?.call(targetCfi, positionWasCommitted);
     };
     service.updateReaderContext(isReady: false, currentCfi: initialCfi);
 

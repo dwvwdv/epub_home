@@ -229,6 +229,24 @@ void main() {
       );
     });
 
+    test('authoritative refresh returns the applied room snapshot', () async {
+      final service = FakeRoomService();
+      final notifier = RoomNotifier(service);
+      addTearDown(notifier.dispose);
+
+      final room = await notifier.createRoom('Alice');
+      service.nextRoom = room!.copyWith(
+        currentCfi: 'epubcfi(/6/20)',
+        revision: 1,
+      );
+
+      final refreshed = await notifier.refreshRoomAndGet();
+
+      expect(refreshed?.currentCfi, 'epubcfi(/6/20)');
+      expect(refreshed?.revision, 1);
+      expect(notifier.state.currentRoom, same(refreshed));
+    });
+
     test('CFI write refreshes and retries one room revision conflict', () async {
       final service = FakeRoomService()
         ..cfiConflicts = 1

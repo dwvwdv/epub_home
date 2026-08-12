@@ -34,6 +34,8 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
   String? _awaitingTurnRoomId;
   String? _queuedTargetCfi;
   String? _displayingTargetCfi;
+  bool _recoveringAuthoritativePosition = false;
+  int _positionRecoveryGeneration = 0;
   Future<void> _cfiWriteChain = Future<void>.value();
 
   // Track key so we can rebuild the viewer when theme changes.
@@ -112,6 +114,7 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
   @override
   void dispose() {
     _isStoppingPageSync = true;
+    ++_positionRecoveryGeneration;
     final pageSync = ref.read(pageSyncProvider.notifier);
     pageSync.updateReaderContext(isReady: false, currentCfi: _currentCfi);
     unawaited(() async {
@@ -174,12 +177,38 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
     _displayCommittedPosition(commit.targetCfi);
   }
 
-  void _handlePositionRecovery(String targetCfi) {
+  void _handlePositionRecovery(
+    String targetCfi,
+    bool positionWasCommitted,
+  ) {
     if (!mounted || _isStoppingPageSync) return;
     _queuedTurnCommand = null;
     _awaitingTurnRelocation = null;
     _awaitingTurnRoomId = null;
     _displayingTargetCfi = null;
+
+    if (!positionWasCommitted) {
+      final roomId = ref.read(roomProvider).currentRoom?.id;
+      if (roomId != null) {
+        final recoveryGeneration = ++_positionRecoveryGeneration;
+        setState(() => _recoveringAuthoritativePosition = true);
+        ref
+            .read(pageSyncProvider.notifier)
+            .updateReaderContext(isReady: false, currentCfi: _currentCfi);
+        unawaited(
+          ref.read(presenceProvider.notifier).updateReaderReady(false),
+        );
+        unawaited(
+          _recoverAuthoritativePosition(
+            fallbackCfi: targetCfi,
+            roomId: roomId,
+            recoveryGeneration: recoveryGeneration,
+          ),
+        );
+        return;
+      }
+    }
+
     ref.read(bookProvider.notifier).updateCfi(targetCfi);
 
     if (!_isReaderReady || _epubController == null) {
@@ -187,6 +216,62 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
       return;
     }
     _displayCommittedPosition(targetCfi);
+  }
+
+  Future<void> _recoverAuthoritativePosition({
+    required String fallbackCfi,
+    required String roomId,
+    required int recoveryGeneration,
+  }) async {
+    String? authoritativeCfi;
+    final roomNotifier = ref.read(roomProvider.notifier);
+
+    while (mounted &&
+        !_isStoppingPageSync &&
+        recoveryGeneration == _positionRecoveryGeneration &&
+        ref.read(roomProvider).currentRoom?.id == roomId) {
+      final cachedCfi = ref.read(roomProvider).currentRoom?.currentCfi;
+      // The requester already received the authoritative row from its
+      // successful write even when the following Realtime commit failed.
+      if (cachedCfi != null && cachedCfi != fallbackCfi) {
+        authoritativeCfi = cachedCfi;
+        break;
+      }
+
+      final refreshedRoom = await roomNotifier.refreshRoomAndGet();
+      if (refreshedRoom != null) {
+        authoritativeCfi = refreshedRoom.currentCfi ?? fallbackCfi;
+        break;
+      }
+      await Future<void>.delayed(const Duration(seconds: 2));
+    }
+
+    if (!mounted ||
+        _isStoppingPageSync ||
+        recoveryGeneration != _positionRecoveryGeneration ||
+        ref.read(roomProvider).currentRoom?.id != roomId) {
+      return;
+    }
+
+    final targetCfi = authoritativeCfi ?? fallbackCfi;
+    ref.read(bookProvider.notifier).updateCfi(targetCfi);
+    setState(() => _recoveringAuthoritativePosition = false);
+    if (_currentCfi != targetCfi) {
+      _displayCommittedPosition(targetCfi);
+      return;
+    }
+
+    ref
+        .read(pageSyncProvider.notifier)
+        .updateReaderContext(isReady: _isReaderReady, currentCfi: targetCfi);
+    try {
+      await ref
+          .read(presenceProvider.notifier)
+          .updateReaderReady(_isReaderReady);
+    } catch (_) {
+      // The cached Presence intent remains authoritative locally and will be
+      // retried by the connection lifecycle after transport recovery.
+    }
   }
 
   void _displayCommittedPosition(String targetCfi) {
@@ -416,6 +501,7 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
                           behavior: HitTestBehavior.opaque,
                           onHorizontalDragEnd: (details) {
                             if (syncState.status != SyncStatus.idle ||
+                                _recoveringAuthoritativePosition ||
                                 _displayingTargetCfi != null) {
                               return;
                             }
@@ -460,6 +546,7 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
     final isIdle =
         syncState.status == SyncStatus.idle &&
         _isReaderReady &&
+        !_recoveringAuthoritativePosition &&
         _displayingTargetCfi == null;
 
     return Container(

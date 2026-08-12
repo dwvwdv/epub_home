@@ -291,23 +291,35 @@ class RoomNotifier extends StateNotifier<RoomState> {
 
   /// Fetch the latest room data from DB (e.g. to get updated CFI on re-entry).
   Future<void> refreshRoom() async {
+    await refreshRoomAndGet();
+  }
+
+  /// Fetch and return an authoritative room snapshot when recovery depends on
+  /// knowing whether the read completed for the current room session.
+  Future<Room?> refreshRoomAndGet() async {
     final room = state.currentRoom;
-    if (room == null) return;
+    if (room == null) return null;
     final roomSessionGeneration = _roomSessionGeneration;
     try {
       final updated = await _roomService.getRoom(room.id);
       if (updated != null) {
-        _applyRoomUpdate(
+        final applied = _applyRoomUpdate(
           updated,
           originRoom: room,
           roomSessionGeneration: roomSessionGeneration,
         );
+        if (applied ||
+            (_isCurrentRoomSession(room.id, roomSessionGeneration) &&
+                state.currentRoom!.revision > updated.revision)) {
+          return state.currentRoom;
+        }
       }
     } catch (error) {
       if (_isCurrentRoomSession(room.id, roomSessionGeneration)) {
         state = state.copyWith(error: error.toString());
       }
     }
+    return null;
   }
 
   Future<void> updateCfi(String cfi) async {

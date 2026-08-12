@@ -554,7 +554,11 @@ void main() {
           requestTimeout: const Duration(milliseconds: 20),
         );
         final recoveries = <String>[];
-        service.onPositionRecovery = recoveries.add;
+        final committedStates = <bool>[];
+        service.onPositionRecovery = (targetCfi, positionWasCommitted) {
+          recoveries.add(targetCfi);
+          committedStates.add(positionWasCommitted);
+        };
         addTearDown(() async {
           await service.dispose();
           await transport.dispose();
@@ -571,6 +575,7 @@ void main() {
         expect(service.currentState.currentRequest, isNull);
         expect(service.currentState.errorMessage, contains('timed out'));
         expect(recoveries, [cfi]);
+        expect(committedStates, [isFalse]);
       },
     );
 
@@ -632,7 +637,11 @@ void main() {
         requestTimeout: const Duration(milliseconds: 20),
       );
       final recoveries = <String>[];
-      service.onPositionRecovery = recoveries.add;
+      final committedStates = <bool>[];
+      service.onPositionRecovery = (targetCfi, positionWasCommitted) {
+        recoveries.add(targetCfi);
+        committedStates.add(positionWasCommitted);
+      };
       addTearDown(() async {
         await service.dispose();
         await transport.dispose();
@@ -659,6 +668,7 @@ void main() {
       expect(service.currentState.status, SyncStatus.idle);
       expect(service.currentState.errorMessage, contains('timed out'));
       expect(recoveries, [targetCfi]);
+      expect(committedStates, [isTrue]);
       expect(
         transport.sentEvents.where(
           (event) => event.event == 'page_turn_complete',
@@ -711,7 +721,11 @@ void main() {
           ..onlineUsers = [readyUser('user-a'), readyUser('user-b')];
         final service = createService(transport, currentCfi: cfi);
         final recoveries = <String>[];
-        service.onPositionRecovery = recoveries.add;
+        final committedStates = <bool>[];
+        service.onPositionRecovery = (targetCfi, positionWasCommitted) {
+          recoveries.add(targetCfi);
+          committedStates.add(positionWasCommitted);
+        };
         addTearDown(() async {
           await service.dispose();
           await transport.dispose();
@@ -744,6 +758,7 @@ void main() {
         expect(service.currentState.status, SyncStatus.idle);
         expect(service.currentState.errorMessage, contains('complete'));
         expect(recoveries, [targetCfi]);
+        expect(committedStates, [isTrue]);
       },
     );
 

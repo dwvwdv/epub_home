@@ -85,7 +85,8 @@ class PageSyncService {
 
   void Function(PageTurnCommand command)? onPageTurn;
   void Function(PagePositionCommit commit)? onPositionCommit;
-  void Function(String targetCfi)? onPositionRecovery;
+  void Function(String targetCfi, bool positionWasCommitted)?
+      onPositionRecovery;
 
   PageSyncService({
     required PageSyncTransport transport,
@@ -1043,11 +1044,13 @@ class PageSyncService {
       // Once the requester has published a commit, that CFI is authoritative
       // (and may already be persisted). Ack/complete failures must converge to
       // it instead of rolling some readers back to the pre-turn page.
-      final recoveryCfi = _positionCommit?.requestId == request.requestId
+      final positionWasCommitted =
+          _positionCommit?.requestId == request.requestId;
+      final recoveryCfi = positionWasCommitted
           ? _positionCommit!.targetCfi
           : request.fromCfi;
       _currentCfi = recoveryCfi;
-      onPositionRecovery?.call(recoveryCfi);
+      onPositionRecovery?.call(recoveryCfi, positionWasCommitted);
     }
     _clearActivePositionState(request.requestId);
     _updateState(PageSyncState.error(message));
