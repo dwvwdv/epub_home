@@ -97,7 +97,9 @@ class RoomNotifier extends StateNotifier<RoomState> {
       if (presenceUsers != null && presenceUsers.isNotEmpty) {
         updateMembersFromPresence(presenceUsers);
       }
-    } catch (_) {}
+    } catch (error) {
+      state = state.copyWith(error: error.toString());
+    }
   }
 
   void updateMembersFromPresence(List<Map<String, dynamic>> onlineUsers) {
@@ -144,7 +146,9 @@ class RoomNotifier extends StateNotifier<RoomState> {
         hasBook: true,
       );
       await refreshMembers();
-    } catch (_) {}
+    } catch (error) {
+      state = state.copyWith(error: error.toString());
+    }
   }
 
   Future<void> updateBookShared({
@@ -154,7 +158,7 @@ class RoomNotifier extends StateNotifier<RoomState> {
     final room = state.currentRoom;
     if (room == null) return;
 
-    await _roomService.updateRoomBook(
+    final updatedRoom = await _roomService.updateRoomBook(
       roomId: room.id,
       bookTitle: bookTitle,
       bookHash: bookHash,
@@ -170,10 +174,7 @@ class RoomNotifier extends StateNotifier<RoomState> {
     }
 
     state = state.copyWith(
-      currentRoom: room.copyWith(
-        currentBookTitle: bookTitle,
-        currentBookHash: bookHash,
-      ),
+      currentRoom: updatedRoom,
     );
 
     await refreshMembers();
@@ -188,26 +189,50 @@ class RoomNotifier extends StateNotifier<RoomState> {
       if (updated != null) {
         state = state.copyWith(currentRoom: updated);
       }
-    } catch (_) {}
+    } catch (error) {
+      state = state.copyWith(error: error.toString());
+    }
   }
 
   Future<void> updateCfi(String cfi) async {
     final room = state.currentRoom;
     if (room == null) return;
 
-    await _roomService.updateRoomCfi(roomId: room.id, cfi: cfi);
-    state = state.copyWith(
-      currentRoom: room.copyWith(currentCfi: cfi),
+    final updatedRoom = await _roomService.updateRoomCfi(
+      roomId: room.id,
+      cfi: cfi,
     );
+    state = state.copyWith(currentRoom: updatedRoom);
+  }
+
+  Future<void> heartbeat() async {
+    final room = state.currentRoom;
+    if (room == null) return;
+
+    try {
+      final updatedRoom = await _roomService.heartbeatRoom(room.id);
+      state = state.copyWith(currentRoom: updatedRoom, error: null);
+    } catch (error) {
+      state = state.copyWith(error: error.toString());
+      rethrow;
+    }
   }
 
   Future<void> leaveRoom() async {
     final room = state.currentRoom;
-    final userId = SupabaseService.currentUserId;
-    if (room == null || userId == null) return;
+    if (room == null) {
+      state = const RoomState();
+      return;
+    }
 
-    await _roomService.leaveRoom(roomId: room.id, userId: userId);
-    state = const RoomState();
+    state = state.copyWith(isLoading: true, error: null);
+    try {
+      await _roomService.leaveRoom(roomId: room.id);
+      state = const RoomState();
+    } catch (error) {
+      state = state.copyWith(isLoading: false, error: error.toString());
+      rethrow;
+    }
   }
 
   void clearError() {

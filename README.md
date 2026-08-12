@@ -24,6 +24,30 @@ This Supabase project is shared by multiple apps. CoTime Book channels are alrea
 private and protected by Realtime RLS. Do not change the project-wide **Allow public
 access to channels** setting unless every app sharing the project has been audited.
 
+### Room lifecycle maintenance
+
+Room membership is changed only through the `create_room`, `join_room`, and
+`leave_room` RPCs. Active clients should call `heartbeat_room` periodically; a
+heartbeat extends the room lease for 24 hours. Do not restore direct `DELETE` access
+on `cotime_book.room_members`, because the RPC serializes concurrent leaves and host
+transfer on the parent room row.
+
+The database exposes a service-role-only maintenance function:
+
+```sql
+select cotime_book.cleanup_expired_rooms();
+```
+
+Schedule it hourly in **Supabase Dashboard → Integrations → Cron** (or another trusted
+service-role scheduler). The shared production project does not currently have
+`pg_cron` installed, so the migration deliberately does not enable a project-wide
+extension or create a hidden schedule. The cleanup closes expired rooms immediately,
+hard-deletes rooms 30 days after closure, and permanently retains their six-character
+codes in `cotime_book_private.room_code_reservations`.
+
+Database lifecycle tests live in `supabase/tests/database/room_lifecycle.test.sql` and
+run with `supabase test db` after applying migrations to a local Supabase database.
+
 This will create:
 - `rooms` - Stores reading rooms
 - `room_members` - Tracks who is in each room

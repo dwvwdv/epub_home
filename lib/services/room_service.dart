@@ -52,46 +52,66 @@ class RoomService {
     required String userId,
     required bool hasBook,
   }) async {
-    await _database
+    final updatedMember = await _database
         .from('room_members')
         .update({'has_book': hasBook})
         .eq('room_id', roomId)
-        .eq('user_id', userId);
+        .eq('user_id', userId)
+        .select('id')
+        .maybeSingle();
+
+    if (updatedMember == null) {
+      throw StateError('Room membership is inactive or no longer exists');
+    }
   }
 
-  Future<void> updateRoomBook({
+  Future<Room> updateRoomBook({
     required String roomId,
     required String bookTitle,
     required String bookHash,
   }) async {
-    await _database.from('rooms').update({
-      'current_book_title': bookTitle,
-      'current_book_hash': bookHash,
-      'updated_at': DateTime.now().toIso8601String(),
-    }).eq('id', roomId);
+    final roomData = await _database
+        .from('rooms')
+        .update({
+          'current_book_title': bookTitle,
+          'current_book_hash': bookHash,
+        })
+        .eq('id', roomId)
+        .select()
+        .single();
+
+    return Room.fromJson(roomData);
   }
 
-  Future<void> updateRoomCfi({
+  Future<Room> updateRoomCfi({
     required String roomId,
     required String cfi,
   }) async {
-    await _database.from('rooms').update({
-      'current_cfi': cfi,
-      'updated_at': DateTime.now().toIso8601String(),
-    }).eq('id', roomId);
+    final roomData = await _database
+        .from('rooms')
+        .update({'current_cfi': cfi})
+        .eq('id', roomId)
+        .select()
+        .single();
+
+    return Room.fromJson(roomData);
   }
 
-  Future<void> leaveRoom({
-    required String roomId,
-    required String userId,
-  }) async {
-    await _database
-        .from('room_members')
-        .delete()
-        .eq('room_id', roomId)
-        .eq('user_id', userId);
+  Future<Map<String, dynamic>> leaveRoom({required String roomId}) async {
+    final result = await _database.rpc(
+      'leave_room',
+      params: {'p_room_id': roomId},
+    );
+    return Map<String, dynamic>.from(result as Map);
+  }
 
-    // The database trigger deactivates the room when its last member leaves.
+  Future<Room> heartbeatRoom(String roomId) async {
+    final roomData = await _database.rpc(
+      'heartbeat_room',
+      params: {'p_room_id': roomId},
+    ).single();
+
+    return Room.fromJson(roomData);
   }
 
   Future<Room?> getRoom(String roomId) async {
