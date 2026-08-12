@@ -17,10 +17,12 @@ The database uses a dedicated `cotime_book` schema. To create or upgrade it:
 2. Select your project
 3. Click on **SQL Editor** in the left sidebar
 4. Click **New Query**
-5. For a new project, run `supabase/migrations/001_initial_schema.sql`
-6. Run each remaining file in `supabase/migrations/` in filename order
-7. Confirm the `cotime_book` schema is listed under **Data API → Exposed Schemas**
-8. In **Realtime → Settings**, disable **Allow public access to channels**
+5. Run every file in `supabase/migrations/` in filename order
+6. Confirm the `cotime_book` schema is listed under **Data API → Exposed Schemas**
+
+This Supabase project is shared by multiple apps. CoTime Book channels are already
+private and protected by Realtime RLS. Do not change the project-wide **Allow public
+access to channels** setting unless every app sharing the project has been audited.
 
 This will create:
 - `rooms` - Stores reading rooms

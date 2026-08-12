@@ -17,6 +17,11 @@ alter table public.profiles set schema cotime_book;
 alter table public.rooms set schema cotime_book;
 alter table public.room_members set schema cotime_book;
 
+-- Room codes are bearer secrets and must never be recycled.
+drop index if exists cotime_book.idx_rooms_code_active;
+create unique index if not exists idx_rooms_code
+  on cotime_book.rooms (code);
+
 update cotime_book.rooms as room
 set is_active = false,
     updated_at = now()
@@ -53,7 +58,7 @@ as $$
     select 1
     from cotime_book.rooms as room
     join cotime_book.room_members as member on member.room_id = room.id
-    where target_topic = 'room:' || room.code
+    where target_topic = 'cotime_book:room:' || room.code
       and room.is_active = true
       and member.user_id = (select auth.uid())
   );
@@ -72,6 +77,7 @@ declare
   current_user_id uuid := auth.uid();
   created_room cotime_book.rooms;
   generated_code text;
+  random_bytes bytea;
   attempt integer;
 begin
   if current_user_id is null then
@@ -89,12 +95,18 @@ begin
   end if;
 
   for attempt in 1..20 loop
+    random_bytes := extensions.gen_random_bytes(6);
+
     select string_agg(
-      substr('ABCDEFGHJKLMNPQRSTUVWXYZ23456789', floor(random() * 32)::integer + 1, 1),
-      '' order by position
+      substr(
+        'ABCDEFGHJKLMNPQRSTUVWXYZ23456789',
+        (get_byte(random_bytes, character_index - 1) % 32) + 1,
+        1
+      ),
+      '' order by character_index
     )
     into generated_code
-    from generate_series(1, 6) as position;
+    from generate_series(1, 6) as generated(character_index);
 
     begin
       insert into cotime_book.rooms (code, host_user_id)

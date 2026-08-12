@@ -1,12 +1,6 @@
--- Step 1/3: create and expose the CoTime Book application schema.
-
-create schema if not exists cotime_book;
-
-grant usage on schema cotime_book to authenticated, service_role;
-revoke usage on schema cotime_book from anon;
-
+-- Normalize the shared Data API schema list after the CoTime Book cutover.
 -- Expose CoTime Book without removing schemas used by other apps.
-do $
+do $$
 declare
   configured_schemas text;
   merged_schemas text;
@@ -52,6 +46,7 @@ begin
     merged_schemas
   );
 end
-$;
+$$;
 
 notify pgrst, 'reload config';
+notify pgrst, 'reload schema';

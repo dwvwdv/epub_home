@@ -1,0 +1,148 @@
+-- Preserve shared Data API schemas and add CoTime Book without clobbering other apps.
+do $$
+declare
+  configured_schemas text;
+  merged_schemas text;
+begin
+  select regexp_replace(setting, '^(pgrst[.]db_schemas=)+', '')
+  into configured_schemas
+  from pg_db_role_setting as role_setting
+  join pg_roles as role on role.oid = role_setting.setrole
+  cross join lateral unnest(role_setting.setconfig) as config(setting)
+  where role.rolname = 'authenticator'
+    and role_setting.setdatabase = 0
+    and setting like 'pgrst.db_schemas=%'
+  limit 1;
+
+  with candidates as (
+    select btrim(value) as schema_name, ordinal::bigint as priority
+    from string_to_table(
+      coalesce(configured_schemas, 'public, graphql_public'),
+      ','
+    ) with ordinality as current_entry(value, ordinal)
+
+    union all
+
+    select 'driftread', 100000
+    where to_regnamespace('driftread') is not null
+
+    union all
+
+    select 'cotime_book', 100001
+  ),
+  deduplicated as (
+    select schema_name, min(priority) as priority
+    from candidates
+    where schema_name <> ''
+    group by schema_name
+  )
+  select string_agg(schema_name, ', ' order by priority)
+  into merged_schemas
+  from deduplicated;
+
+  execute format(
+    'alter role authenticator set pgrst.db_schemas = %L',
+    merged_schemas
+  );
+end
+$$;
+
+-- A retired code must never identify a future room.
+drop index if exists cotime_book.idx_rooms_code_active;
+create unique index if not exists idx_rooms_code
+  on cotime_book.rooms (code);
+
+create or replace function cotime_book.can_access_room_topic(target_topic text)
+returns boolean
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select exists (
+    select 1
+    from cotime_book.rooms as room
+    join cotime_book.room_members as member on member.room_id = room.id
+    where target_topic = 'cotime_book:room:' || room.code
+      and room.is_active = true
+      and member.user_id = (select auth.uid())
+  );
+$$;
+
+create or replace function cotime_book.create_room(
+  p_nickname text,
+  p_avatar_color_index integer default 0
+)
+returns cotime_book.rooms
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  current_user_id uuid := auth.uid();
+  created_room cotime_book.rooms;
+  generated_code text;
+  random_bytes bytea;
+  attempt integer;
+begin
+  if current_user_id is null then
+    raise exception 'Authentication required' using errcode = '42501';
+  end if;
+
+  if char_length(btrim(coalesce(p_nickname, ''))) not between 1 and 30 then
+    raise exception 'Nickname must contain between 1 and 30 characters'
+      using errcode = '22023';
+  end if;
+
+  if p_avatar_color_index not between 0 and 7 then
+    raise exception 'Avatar color index must be between 0 and 7'
+      using errcode = '22023';
+  end if;
+
+  for attempt in 1..20 loop
+    random_bytes := extensions.gen_random_bytes(6);
+
+    select string_agg(
+      substr(
+        'ABCDEFGHJKLMNPQRSTUVWXYZ23456789',
+        (get_byte(random_bytes, character_index - 1) % 32) + 1,
+        1
+      ),
+      '' order by character_index
+    )
+    into generated_code
+    from generate_series(1, 6) as generated(character_index);
+
+    begin
+      insert into cotime_book.rooms (code, host_user_id)
+      values (generated_code, current_user_id)
+      returning * into created_room;
+      exit;
+    exception when unique_violation then
+      created_room := null;
+    end;
+  end loop;
+
+  if created_room.id is null then
+    raise exception 'Unable to allocate a unique room code'
+      using errcode = '55000';
+  end if;
+
+  insert into cotime_book.room_members (
+    room_id,
+    user_id,
+    nickname,
+    avatar_color_index
+  ) values (
+    created_room.id,
+    current_user_id,
+    btrim(p_nickname),
+    p_avatar_color_index
+  );
+
+  return created_room;
+end;
+$$;
+
+notify pgrst, 'reload config';
+notify pgrst, 'reload schema';
