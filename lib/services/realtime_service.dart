@@ -126,6 +126,7 @@ class RealtimeService {
     'page_position_commit',
     'page_position_ack',
     'page_turn_complete',
+    'reading_session_leave',
     'book_shared',
     'book_chunk',
     'transfer_request',

@@ -27,6 +27,8 @@ class PageSyncNotifier extends StateNotifier<PageSyncState> {
     required RealtimeService realtimeService,
     required String currentUserId,
     required String currentNickname,
+    required String readingSessionId,
+    required Set<String> expectedParticipantUserIds,
     String? initialCfi,
   }) async {
     final generation = ++_lifecycleGeneration;
@@ -38,6 +40,8 @@ class PageSyncNotifier extends StateNotifier<PageSyncState> {
       transport: RealtimePageSyncTransport(realtimeService),
       currentUserId: currentUserId,
       currentNickname: currentNickname,
+      readingSessionId: readingSessionId,
+      expectedParticipantUserIds: expectedParticipantUserIds,
     );
     _service = service;
     service.onPageTurn = (command) => onPageTurn?.call(command);
@@ -82,6 +86,24 @@ class PageSyncNotifier extends StateNotifier<PageSyncState> {
 
   Future<bool> acknowledgePagePosition(String targetCfi) async {
     return await _service?.acknowledgePagePosition(targetCfi) ?? false;
+  }
+
+  void reportPositionPersistenceFailure({
+    required String requestId,
+    required Object error,
+  }) {
+    _service?.reportPositionPersistenceFailure(
+      requestId: requestId,
+      error: error,
+    );
+  }
+
+  bool isRequestActive(String requestId) {
+    return _service?.isRequestActive(requestId) ?? false;
+  }
+
+  Future<void> leaveReadingSession() async {
+    await _service?.leaveReadingSession();
   }
 
   Future<void> stop({bool clearCallbacks = true}) async {

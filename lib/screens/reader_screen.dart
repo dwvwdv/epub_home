@@ -12,6 +12,7 @@ import '../providers/page_sync_provider.dart';
 import '../providers/presence_provider.dart';
 import '../providers/reading_preferences_provider.dart';
 import '../providers/room_provider.dart';
+import '../services/room_service.dart';
 import '../widgets/sync_status_bar.dart';
 
 class ReaderScreen extends ConsumerStatefulWidget {
@@ -30,6 +31,7 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
   bool _isStoppingPageSync = false;
   PageTurnCommand? _queuedTurnCommand;
   PageTurnCommand? _awaitingTurnRelocation;
+  String? _awaitingTurnRoomId;
   String? _queuedTargetCfi;
   String? _displayingTargetCfi;
   Future<void> _cfiWriteChain = Future<void>.value();
@@ -53,6 +55,20 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
     final realtimeService = ref.read(realtimeServiceProvider);
 
     if (!authState.isAuthenticated) return;
+    final roomState = ref.read(roomProvider);
+    final readingSessionId = roomState.readingSessionId;
+    final participantUserIds = roomState.readingParticipantUserIds;
+    if (readingSessionId == null ||
+        participantUserIds.isEmpty ||
+        !participantUserIds.contains(authState.userId)) {
+      if (mounted) {
+        context.goNamed(
+          'lobby',
+          pathParameters: {'roomCode': widget.roomCode},
+        );
+      }
+      return;
+    }
 
     // Entering the route means "reading", but the client must remain outside
     // the page-turn quorum until the EPUB controller has loaded its chapters.
@@ -70,6 +86,8 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
       realtimeService: realtimeService,
       currentUserId: authState.userId!,
       currentNickname: authState.nickname,
+      readingSessionId: readingSessionId,
+      expectedParticipantUserIds: participantUserIds,
       initialCfi: _currentCfi,
     );
     if (!mounted || _isStoppingPageSync) return;
@@ -96,7 +114,13 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
     _isStoppingPageSync = true;
     final pageSync = ref.read(pageSyncProvider.notifier);
     pageSync.updateReaderContext(isReady: false, currentCfi: _currentCfi);
-    unawaited(pageSync.stop());
+    unawaited(() async {
+      try {
+        await pageSync.leaveReadingSession();
+      } finally {
+        await pageSync.stop();
+      }
+    }());
     final presence = ref.read(presenceProvider.notifier);
     unawaited(() async {
       // Preserve track ordering during route disposal so a slower
@@ -126,6 +150,7 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
 
     _queuedTurnCommand = null;
     _awaitingTurnRelocation = command;
+    _awaitingTurnRoomId = ref.read(roomProvider).currentRoom?.id;
     if (command.direction == PageTurnDirection.next) {
       controller.next();
     } else {
@@ -137,6 +162,7 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
     if (!mounted || _isStoppingPageSync) return;
     _queuedTurnCommand = null;
     _awaitingTurnRelocation = null;
+    _awaitingTurnRoomId = null;
     ref.read(bookProvider.notifier).updateCfi(commit.targetCfi);
 
     if (!_isReaderReady || _epubController == null) {
@@ -150,6 +176,7 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
     if (!mounted || _isStoppingPageSync) return;
     _queuedTurnCommand = null;
     _awaitingTurnRelocation = null;
+    _awaitingTurnRoomId = null;
     _displayingTargetCfi = null;
     ref.read(bookProvider.notifier).updateCfi(targetCfi);
 
@@ -190,23 +217,40 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
   Future<void> _commitRequesterPosition(
     PageTurnCommand command,
     String targetCfi,
+    String roomId,
   ) async {
     if (!command.isRequester || _isStoppingPageSync) return;
-    final committed = await ref
-        .read(pageSyncProvider.notifier)
-        .commitPagePosition(targetCfi);
-    if (!committed || !mounted) return;
-
-    // The requester is the sole database writer. Followers only display the
-    // committed CFI received through Realtime. Serialize writes so a slower
-    // older request can never overwrite a newer committed position.
+    // The requester is the sole database writer. Do not publish the Realtime
+    // commit until its CFI is durable; followers therefore never advance to a
+    // position that a later join cannot load from the database.
     final roomNotifier = ref.read(roomProvider.notifier);
     _cfiWriteChain = _cfiWriteChain.then((_) async {
-      try {
-        await roomNotifier.updateCfi(targetCfi);
-      } catch (_) {
-        // Realtime convergence already succeeded. Keep the write chain usable;
-        // a later committed CFI must still be allowed to persist.
+      while (mounted &&
+          !_isStoppingPageSync &&
+          ref.read(pageSyncProvider.notifier).isRequestActive(command.requestId)) {
+        try {
+          await roomNotifier
+              .updateCfiForRoom(roomId: roomId, cfi: targetCfi)
+              .timeout(const Duration(seconds: 10));
+          if (!mounted || _isStoppingPageSync) return;
+          final pageSync = ref.read(pageSyncProvider.notifier);
+          final committed = await pageSync.commitPagePosition(targetCfi);
+          if (committed) {
+            await pageSync.acknowledgePagePosition(targetCfi);
+            return;
+          }
+          await Future<void>.delayed(const Duration(seconds: 2));
+        } on RoomSessionChangedException {
+          return;
+        } catch (error) {
+          ref
+              .read(pageSyncProvider.notifier)
+              .reportPositionPersistenceFailure(
+                requestId: command.requestId,
+                error: error,
+              );
+          await Future<void>.delayed(const Duration(seconds: 2));
+        }
       }
     });
     await _cfiWriteChain;
@@ -329,11 +373,19 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
                           }
 
                           final command = _awaitingTurnRelocation;
+                          final roomId = _awaitingTurnRoomId;
                           if (command != null) {
                             _awaitingTurnRelocation = null;
-                            unawaited(
-                              _commitRequesterPosition(command, relocatedCfi),
-                            );
+                            _awaitingTurnRoomId = null;
+                            if (roomId != null) {
+                              unawaited(
+                                _commitRequesterPosition(
+                                  command,
+                                  relocatedCfi,
+                                  roomId,
+                                ),
+                              );
+                            }
                           }
                         },
                       ),
@@ -619,6 +671,11 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
     final pageSync = ref.read(pageSyncProvider.notifier);
     pageSync.updateReaderContext(isReady: false, currentCfi: _currentCfi);
     final presence = ref.read(presenceProvider.notifier);
+    try {
+      await pageSync.leaveReadingSession();
+    } catch (_) {
+      // Presence state still marks this reader as leaving below.
+    }
     try {
       await pageSync.stop();
     } catch (_) {

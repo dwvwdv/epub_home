@@ -50,6 +50,7 @@ void main() {
   testWidgets('confirmation progress ignores spoofed non-quorum ids',
       (tester) async {
     final request = PageTurnRequest(
+      sessionId: 'session-1',
       requestId: 'request-1',
       requestedByUserId: 'user-a',
       requestedByNickname: 'Alice',

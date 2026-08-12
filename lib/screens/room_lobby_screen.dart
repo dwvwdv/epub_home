@@ -3,6 +3,7 @@ import 'package:collection/collection.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
+import 'package:uuid/uuid.dart';
 import '../config/theme.dart';
 import '../models/transfer_state.dart';
 import '../providers/auth_provider.dart';
@@ -125,9 +126,29 @@ class _RoomLobbyScreenState extends ConsumerState<RoomLobbyScreen> {
           .broadcastStream('start_reading')
           .listen((payload) {
             if (!mounted || _isNavigatingToReader) return;
-            final currentRoom = ref.read(roomProvider).currentRoom;
+            final currentRoomState = ref.read(roomProvider);
+            final currentRoom = currentRoomState.currentRoom;
             if (currentRoom == null ||
                 payload['initiated_by'] != currentRoom.hostUserId) {
+              return;
+            }
+            final sessionId = payload['session_id'];
+            final rawParticipantUserIds = payload['participant_user_ids'];
+            if (sessionId is! String ||
+                sessionId.isEmpty ||
+                rawParticipantUserIds is! List) {
+              return;
+            }
+            final participantUserIds = rawParticipantUserIds
+                .whereType<String>()
+                .toSet();
+            final roomMemberUserIds = currentRoomState.members
+                .map((member) => member.userId)
+                .toSet();
+            if (participantUserIds.length != rawParticipantUserIds.length ||
+                participantUserIds.length != roomMemberUserIds.length ||
+                !participantUserIds.containsAll(roomMemberUserIds)) {
+              _showError('The reading session roster is out of date.');
               return;
             }
             if (currentRoom.currentBookHash == null ||
@@ -137,6 +158,10 @@ class _RoomLobbyScreenState extends ConsumerState<RoomLobbyScreen> {
               _showError('The shared book is not ready on this device.');
               return;
             }
+            ref.read(roomProvider.notifier).beginReadingSession(
+              sessionId: sessionId,
+              participantUserIds: participantUserIds,
+            );
             _isNavigatingToReader = true;
             context.goNamed('reader', pathParameters: {'roomCode': room.code});
           });
@@ -459,9 +484,20 @@ class _RoomLobbyScreenState extends ConsumerState<RoomLobbyScreen> {
       return;
     }
     try {
+      final participantUserIds = ref
+          .read(roomProvider)
+          .members
+          .map((member) => member.userId)
+          .toList()
+        ..sort();
       await realtimeService.broadcast(
         event: 'start_reading',
-        payload: {'room_code': widget.roomCode, 'initiated_by': currentUserId},
+        payload: {
+          'room_code': widget.roomCode,
+          'initiated_by': currentUserId,
+          'session_id': const Uuid().v4(),
+          'participant_user_ids': participantUserIds,
+        },
       );
       // Broadcast is configured with self=true. The single listener above
       // performs navigation for host and guests, avoiding host double-nav.

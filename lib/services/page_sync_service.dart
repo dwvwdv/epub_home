@@ -54,6 +54,8 @@ class PageSyncService {
   final PageSyncTransport _transport;
   final String _currentUserId;
   final String _currentNickname;
+  final String _readingSessionId;
+  final Set<String> _expectedParticipantUserIds;
   final Uuid _uuid;
   final Duration _requestTimeout;
 
@@ -67,6 +69,7 @@ class PageSyncService {
   final Set<String> _sentAckIds = {};
   final Set<String> _completeInFlightIds = {};
   final Set<String> _seenRequestIds = {};
+  final Set<String> _enteredReaderParticipantIds = {};
 
   Timer? _timeoutTimer;
   PageSyncState _state = const PageSyncState.idle();
@@ -86,11 +89,16 @@ class PageSyncService {
     required PageSyncTransport transport,
     required String currentUserId,
     required String currentNickname,
+    required String readingSessionId,
+    required Set<String> expectedParticipantUserIds,
     Uuid uuid = const Uuid(),
     Duration requestTimeout = const Duration(seconds: 30),
   }) : _transport = transport,
        _currentUserId = currentUserId,
        _currentNickname = currentNickname,
+       _readingSessionId = readingSessionId,
+       _expectedParticipantUserIds = Set.of(expectedParticipantUserIds)
+         ..add(currentUserId),
        _uuid = uuid,
        _requestTimeout = requestTimeout;
 
@@ -121,6 +129,9 @@ class PageSyncService {
       _transport
           .broadcastStream('page_turn_complete')
           .listen(_onPageTurnComplete),
+      _transport
+          .broadcastStream('reading_session_leave')
+          .listen(_onReadingSessionLeave),
       _transport.presenceStream.listen(_onPresenceChange),
     ]);
 
@@ -171,6 +182,7 @@ class PageSyncService {
     }
 
     final request = PageTurnRequest(
+      sessionId: _readingSessionId,
       requestId: _uuid.v4(),
       requestedByUserId: _currentUserId,
       requestedByNickname: _currentNickname,
@@ -275,13 +287,56 @@ class PageSyncService {
         payload: commit.toJson(),
       );
     } catch (error) {
-      _failRequest(request, 'Could not synchronize the new page: $error');
+      _startTimeout(request.requestId);
+      _updateState(
+        _state.copyWith(
+          errorMessage: 'Page saved, but synchronization failed; retrying: $error',
+        ),
+      );
       return false;
     }
 
     _applyPositionCommit(commit);
-    unawaited(acknowledgePagePosition(targetCfi));
     return true;
+  }
+
+  void reportPositionPersistenceFailure({
+    required String requestId,
+    required Object error,
+  }) {
+    final request = _state.currentRequest;
+    if (_disposed ||
+        request == null ||
+        request.requestId != requestId ||
+        !_handledExecuteIds.contains(requestId)) {
+      return;
+    }
+    _startTimeout(requestId);
+    _updateState(
+      _state.copyWith(
+        errorMessage: 'Page moved, but saving failed; retrying: $error',
+      ),
+    );
+  }
+
+  bool isRequestActive(String requestId) {
+    return !_disposed && _state.currentRequest?.requestId == requestId;
+  }
+
+  Future<void> leaveReadingSession() async {
+    if (_disposed || !_initialized) return;
+    final payload = {
+      'session_id': _readingSessionId,
+      'user_id': _currentUserId,
+    };
+    try {
+      await _transport.broadcast(
+        event: 'reading_session_leave',
+        payload: payload,
+      );
+    } finally {
+      _onReadingSessionLeave(payload);
+    }
   }
 
   /// Acknowledges that this reader has actually displayed the committed CFI.
@@ -370,7 +425,11 @@ class PageSyncService {
   }
 
   bool _isValidIncomingRequest(PageTurnRequest request) {
-    if (!_readerReady || _currentCfi != request.fromCfi) return false;
+    if (request.sessionId != _readingSessionId ||
+        !_readerReady ||
+        _currentCfi != request.fromCfi) {
+      return false;
+    }
     final age = DateTime.now().toUtc().difference(request.requestedAt);
     if (age > _requestTimeout || age < -_maxClockSkew) return false;
     if (request.requiredUserIds.isEmpty ||
@@ -542,6 +601,13 @@ class PageSyncService {
     }
 
     _positionAckUserIds.add(userId);
+    _checkDisplayCompletion(request, commit);
+  }
+
+  void _checkDisplayCompletion(
+    PageTurnRequest request,
+    PagePositionCommit commit,
+  ) {
     if (request.requestedByUserId == _currentUserId &&
         request.requiredUserIds.every(_positionAckUserIds.contains)) {
       unawaited(_completePageTurn(request, commit));
@@ -641,9 +707,16 @@ class PageSyncService {
     if (eventType != 'leave' && eventType != 'sync') return;
 
     final current = _state.currentRequest;
-    if (current == null) return;
-
     final onlineUsers = _transport.getOnlineUsers();
+    _recordEnteredReaders(onlineUsers);
+    if (eventType == 'leave') {
+      final departedReaders = _enteredReaderParticipantIds.where((userId) {
+        return !_isReadingParticipantOnline(userId, onlineUsers);
+      }).toSet();
+      _enteredReaderParticipantIds.removeAll(departedReaders);
+      _expectedParticipantUserIds.removeAll(departedReaders);
+    }
+    if (current == null) return;
     final isExecuting = _handledExecuteIds.contains(current.requestId);
     final remainingRequired = current.requiredUserIds.where((userId) {
       return isExecuting
@@ -663,7 +736,44 @@ class PageSyncService {
 
     final updated = current.copyWith(requiredUserIds: remainingRequired);
     _updateState(_state.copyWith(currentRequest: updated, clearError: true));
-    _checkConsensus(updated);
+    final commit = _positionCommit;
+    if (commit != null && commit.requestId == updated.requestId) {
+      _checkDisplayCompletion(updated, commit);
+    } else {
+      _checkConsensus(updated);
+    }
+  }
+
+  void _onReadingSessionLeave(Map<String, dynamic> payload) {
+    if (_disposed || payload['session_id'] != _readingSessionId) return;
+    final userId = payload['user_id'];
+    if (userId is! String || !_expectedParticipantUserIds.remove(userId)) {
+      return;
+    }
+    _enteredReaderParticipantIds.remove(userId);
+
+    final current = _state.currentRequest;
+    if (current == null || !current.requiredUserIds.contains(userId)) return;
+    if (current.requestedByUserId == userId) {
+      unawaited(_cancelRequest(current, 'requester_left_reading_session'));
+      return;
+    }
+
+    final remainingRequired = Set<String>.from(current.requiredUserIds)
+      ..remove(userId);
+    if (remainingRequired.isEmpty ||
+        !remainingRequired.contains(current.requestedByUserId)) {
+      unawaited(_cancelRequest(current, 'reading_session_ended'));
+      return;
+    }
+    final updated = current.copyWith(requiredUserIds: remainingRequired);
+    _updateState(_state.copyWith(currentRequest: updated, clearError: true));
+    final commit = _positionCommit;
+    if (commit != null && commit.requestId == updated.requestId) {
+      _checkDisplayCompletion(updated, commit);
+    } else {
+      _checkConsensus(updated);
+    }
   }
 
   void _checkConsensus(PageTurnRequest request) {
@@ -754,26 +864,24 @@ class PageSyncService {
       );
     }
 
+    _recordEnteredReaders(users);
+    final usersById = {
+      for (final user in users)
+        if (user['user_id'] is String) user['user_id'] as String: user,
+    };
     final readyUserIds = <String>{};
     var hasUnreadyReader = false;
-    for (final user in users) {
-      final userId = user['user_id'];
-      if (userId is! String || user['is_reading'] != true) continue;
-
-      if (userId == _currentUserId) {
-        if (_readerReady && user['reader_ready'] == true) {
-          readyUserIds.add(userId);
-        } else {
-          hasUnreadyReader = true;
-        }
-        continue;
-      }
-
-      if (user['reader_ready'] == true) {
+    for (final userId in _expectedParticipantUserIds) {
+      final user = usersById[userId];
+      final isReady = user != null &&
+          user['is_reading'] == true &&
+          user['reader_ready'] == true &&
+          (userId != _currentUserId || _readerReady);
+      if (isReady) {
         readyUserIds.add(userId);
       } else {
-        // Never omit a loading/legacy reader from the quorum. Doing so would
-        // silently turn a multi-reader room into a solo page turn.
+        // The participant roster is frozen by the start-reading event. A
+        // slower client stays pending even while it still reports lobby state.
         hasUnreadyReader = true;
       }
     }
@@ -789,6 +897,17 @@ class PageSyncService {
       );
     }
     return _ReadyReaderQuorum(readyUserIds);
+  }
+
+  void _recordEnteredReaders(List<Map<String, dynamic>> users) {
+    for (final user in users) {
+      final userId = user['user_id'];
+      if (userId is String &&
+          _expectedParticipantUserIds.contains(userId) &&
+          user['is_reading'] == true) {
+        _enteredReaderParticipantIds.add(userId);
+      }
+    }
   }
 
   bool _isReadyReaderOnline(String userId, List<Map<String, dynamic>> users) {

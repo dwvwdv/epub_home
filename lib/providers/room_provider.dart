@@ -3,13 +3,23 @@ import 'dart:async';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../models/room.dart';
 import '../models/room_member.dart';
+import '../providers/page_sync_provider.dart';
+import '../providers/presence_provider.dart';
 import '../services/room_service.dart';
 import '../services/supabase_service.dart';
 
 final roomServiceProvider = Provider<RoomService>((ref) => RoomService());
 
 final roomProvider = StateNotifierProvider<RoomNotifier, RoomState>((ref) {
-  return RoomNotifier(ref.read(roomServiceProvider));
+  return RoomNotifier(
+    ref.read(roomServiceProvider),
+    onSessionRevoked: () async {
+      await Future.wait<void>([
+        ref.read(pageSyncProvider.notifier).stop(),
+        ref.read(presenceProvider.notifier).leaveRoom(),
+      ]);
+    },
+  );
 });
 
 class RoomState {
@@ -17,12 +27,16 @@ class RoomState {
   final List<RoomMember> members;
   final bool isLoading;
   final String? error;
+  final String? readingSessionId;
+  final Set<String> readingParticipantUserIds;
 
   const RoomState({
     this.currentRoom,
     this.members = const [],
     this.isLoading = false,
     this.error,
+    this.readingSessionId,
+    this.readingParticipantUserIds = const {},
   });
 
   bool get isInRoom => currentRoom != null;
@@ -37,12 +51,20 @@ class RoomState {
     List<RoomMember>? members,
     bool? isLoading,
     String? error,
+    String? readingSessionId,
+    Set<String>? readingParticipantUserIds,
+    bool clearReadingSession = false,
   }) {
     return RoomState(
       currentRoom: currentRoom ?? this.currentRoom,
       members: members ?? this.members,
       isLoading: isLoading ?? this.isLoading,
       error: error,
+      readingSessionId:
+          clearReadingSession ? null : readingSessionId ?? this.readingSessionId,
+      readingParticipantUserIds: clearReadingSession
+          ? const {}
+          : readingParticipantUserIds ?? this.readingParticipantUserIds,
     );
   }
 }
@@ -51,11 +73,35 @@ class RoomNotifier extends StateNotifier<RoomState> {
   static const heartbeatInterval = Duration(minutes: 5);
 
   final RoomService _roomService;
+  final Future<void> Function()? _onSessionRevoked;
   Timer? _heartbeatTimer;
   bool _heartbeatInFlight = false;
   bool _appIsActive = true;
+  bool _revocationInProgress = false;
 
-  RoomNotifier(this._roomService) : super(const RoomState());
+  RoomNotifier(
+    this._roomService, {
+    Future<void> Function()? onSessionRevoked,
+  }) : _onSessionRevoked = onSessionRevoked,
+       super(const RoomState());
+
+  void beginReadingSession({
+    required String sessionId,
+    required Set<String> participantUserIds,
+  }) {
+    final currentUserId = SupabaseService.currentUserId;
+    if (sessionId.isEmpty ||
+        participantUserIds.isEmpty ||
+        (currentUserId != null &&
+            !participantUserIds.contains(currentUserId))) {
+      throw ArgumentError('Invalid reading session roster');
+    }
+    state = state.copyWith(
+      readingSessionId: sessionId,
+      readingParticipantUserIds: Set.unmodifiable(participantUserIds),
+      error: null,
+    );
+  }
 
   Future<Room?> createRoom(String nickname) async {
     state = state.copyWith(isLoading: true, error: null);
@@ -66,6 +112,7 @@ class RoomNotifier extends StateNotifier<RoomState> {
         currentRoom: room,
         members: members,
         isLoading: false,
+        clearReadingSession: true,
       );
       _startHeartbeat(room.id);
       return room;
@@ -87,6 +134,7 @@ class RoomNotifier extends StateNotifier<RoomState> {
         currentRoom: room,
         members: members,
         isLoading: false,
+        clearReadingSession: true,
       );
       _startHeartbeat(room.id);
       return room;
@@ -207,11 +255,29 @@ class RoomNotifier extends StateNotifier<RoomState> {
     final room = state.currentRoom;
     if (room == null) return;
 
-    final updatedRoom = await _roomService.updateRoomCfi(
-      roomId: room.id,
-      cfi: cfi,
-    );
-    state = state.copyWith(currentRoom: updatedRoom);
+    await updateCfiForRoom(roomId: room.id, cfi: cfi);
+  }
+
+  Future<void> updateCfiForRoom({
+    required String roomId,
+    required String cfi,
+  }) async {
+    if (state.currentRoom?.id != roomId) {
+      throw RoomSessionChangedException(roomId);
+    }
+
+    final Room updatedRoom;
+    try {
+      updatedRoom = await _roomService.updateRoomCfi(
+        roomId: roomId,
+        cfi: cfi,
+      );
+    } on RoomSessionRevokedException catch (error) {
+      await _revokeSession(roomId, error.message);
+      rethrow;
+    }
+    if (state.currentRoom?.id != roomId) return;
+    state = state.copyWith(currentRoom: updatedRoom, error: null);
   }
 
   Future<void> heartbeat() async {
@@ -264,6 +330,9 @@ class RoomNotifier extends StateNotifier<RoomState> {
       if (state.currentRoom?.id == roomId) {
         state = state.copyWith(currentRoom: updatedRoom, error: null);
       }
+    } on RoomSessionRevokedException catch (error) {
+      await _revokeSession(roomId, error.message);
+      if (rethrowError) rethrow;
     } catch (error) {
       if (state.currentRoom?.id == roomId) {
         state = state.copyWith(error: error.toString());
@@ -271,6 +340,22 @@ class RoomNotifier extends StateNotifier<RoomState> {
       if (rethrowError) rethrow;
     } finally {
       _heartbeatInFlight = false;
+    }
+  }
+
+  Future<void> _revokeSession(String roomId, String reason) async {
+    if (_revocationInProgress || state.currentRoom?.id != roomId) return;
+    _revocationInProgress = true;
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = null;
+    state = RoomState(error: reason);
+    try {
+      await _onSessionRevoked?.call();
+    } catch (_) {
+      // The authoritative room state is already revoked. Best-effort transport
+      // cleanup must not turn a periodic heartbeat into an unhandled error.
+    } finally {
+      _revocationInProgress = false;
     }
   }
 

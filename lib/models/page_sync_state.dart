@@ -21,6 +21,7 @@ enum SyncStatus {
 }
 
 class PageTurnRequest {
+  final String sessionId;
   final String requestId;
   final String requestedByUserId;
   final String requestedByNickname;
@@ -31,6 +32,7 @@ class PageTurnRequest {
   final Set<String> requiredUserIds;
 
   const PageTurnRequest({
+    required this.sessionId,
     required this.requestId,
     required this.requestedByUserId,
     required this.requestedByNickname,
@@ -60,6 +62,7 @@ class PageTurnRequest {
     Set<String>? requiredUserIds,
   }) {
     return PageTurnRequest(
+      sessionId: sessionId,
       requestId: requestId,
       requestedByUserId: requestedByUserId,
       requestedByNickname: requestedByNickname,
@@ -73,6 +76,7 @@ class PageTurnRequest {
 
   Map<String, dynamic> toJson() {
     return {
+      'session_id': sessionId,
       'request_id': requestId,
       'user_id': requestedByUserId,
       'nickname': requestedByNickname,
@@ -89,6 +93,7 @@ class PageTurnRequest {
       throw const FormatException('Invalid page turn direction');
     }
 
+    final sessionId = json['session_id'];
     final requestId = json['request_id'];
     final requestedByUserId = json['user_id'];
     final fromCfi = json['from_cfi'];
@@ -96,7 +101,9 @@ class PageTurnRequest {
     final requestedAt = rawRequestedAt is String
         ? DateTime.tryParse(rawRequestedAt)
         : null;
-    if (requestId is! String ||
+    if (sessionId is! String ||
+        sessionId.isEmpty ||
+        requestId is! String ||
         requestId.isEmpty ||
         requestedByUserId is! String ||
         requestedByUserId.isEmpty ||
@@ -118,6 +125,7 @@ class PageTurnRequest {
     }
 
     return PageTurnRequest(
+      sessionId: sessionId,
       requestId: requestId,
       requestedByUserId: requestedByUserId,
       requestedByNickname: json['nickname'] is String

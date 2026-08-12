@@ -77,7 +77,7 @@ void main() {
     });
 
     test(
-      'quorum contains unique ready readers and excludes lobby users',
+      'frozen roster keeps a transitioning lobby member pending',
       () async {
         final transport = FakePageSyncTransport()
           ..onlineUsers = [
@@ -102,14 +102,46 @@ void main() {
           fromCfi: cfi,
         );
 
-        expect(requested, isTrue);
-        expect(service.currentState.status, SyncStatus.requesting);
-        expect(service.currentState.currentRequest!.requiredUserIds, {
-          'user-a',
-          'user-b',
-        });
+        expect(requested, isFalse);
+        expect(service.currentState.status, SyncStatus.idle);
+        expect(service.currentState.errorMessage, contains('become ready'));
+        expect(transport.sentEvents, isEmpty);
       },
     );
+
+    test('explicit session leave removes a transitioning member', () async {
+      final transport = FakePageSyncTransport()
+        ..onlineUsers = [
+          readyUser('user-a'),
+          {'user_id': 'user-b', 'is_reading': false, 'reader_ready': false},
+        ];
+      final service = createService(transport, currentCfi: cfi);
+      addTearDown(() async {
+        await service.dispose();
+        await transport.dispose();
+      });
+
+      expect(
+        await service.requestPageTurn(
+          direction: PageTurnDirection.next,
+          fromCfi: cfi,
+        ),
+        isFalse,
+      );
+
+      transport.emit('reading_session_leave', {
+        'session_id': 'session-1',
+        'user_id': 'user-b',
+      });
+      await flushEvents();
+      expect(
+        await service.requestPageTurn(
+          direction: PageTurnDirection.next,
+          fromCfi: cfi,
+        ),
+        isTrue,
+      );
+    });
 
     test(
       'self echo executes and commits a requester turn exactly once',
@@ -377,6 +409,49 @@ void main() {
     );
 
     test(
+      'requester completes when an unacked reader leaves after commit',
+      () async {
+        final transport = FakePageSyncTransport()
+          ..onlineUsers = [readyUser('user-a'), readyUser('user-b')];
+        final service = createService(transport, currentCfi: cfi);
+        addTearDown(() async {
+          await service.dispose();
+          await transport.dispose();
+        });
+
+        await service.requestPageTurn(
+          direction: PageTurnDirection.next,
+          fromCfi: cfi,
+        );
+        final requestId = service.currentState.currentRequest!.requestId;
+        transport.emit('page_turn_confirm', {
+          'request_id': requestId,
+          'user_id': 'user-b',
+        });
+        await flushEvents();
+
+        const targetCfi = 'epubcfi(/6/9)';
+        service.updateReaderContext(isReady: true, currentCfi: targetCfi);
+        expect(await service.commitPagePosition(targetCfi), isTrue);
+        expect(await service.acknowledgePagePosition(targetCfi), isTrue);
+        await flushEvents();
+        expect(service.currentState.status, SyncStatus.turning);
+
+        transport.onlineUsers = [readyUser('user-a')];
+        transport.emitPresence({'event': 'leave'});
+        await flushEvents();
+
+        expect(service.currentState.status, SyncStatus.idle);
+        expect(
+          transport.sentEvents.where(
+            (event) => event.event == 'page_turn_complete',
+          ),
+          hasLength(1),
+        );
+      },
+    );
+
+    test(
       'ignores a delayed confirmation from a reader that became unready',
       () async {
         final transport = FakePageSyncTransport()
@@ -486,6 +561,43 @@ void main() {
       );
     });
 
+    test('database persistence failure remains retryable before commit', () async {
+      final transport = FakePageSyncTransport()
+        ..onlineUsers = [readyUser('user-a')];
+      final service = createService(transport, currentCfi: cfi);
+      addTearDown(() async {
+        await service.dispose();
+        await transport.dispose();
+      });
+
+      await service.requestPageTurn(
+        direction: PageTurnDirection.next,
+        fromCfi: cfi,
+      );
+      final requestId = service.currentState.currentRequest!.requestId;
+      const targetCfi = 'epubcfi(/6/11)';
+      service.updateReaderContext(isReady: true, currentCfi: targetCfi);
+      service.reportPositionPersistenceFailure(
+        requestId: requestId,
+        error: StateError('database unavailable'),
+      );
+
+      expect(service.currentState.status, SyncStatus.turning);
+      expect(service.currentState.currentRequest?.requestId, requestId);
+      expect(service.currentState.errorMessage, contains('retrying'));
+      expect(
+        transport.sentEvents.where(
+          (event) => event.event == 'page_position_commit',
+        ),
+        isEmpty,
+      );
+
+      expect(await service.commitPagePosition(targetCfi), isTrue);
+      expect(await service.acknowledgePagePosition(targetCfi), isTrue);
+      await flushEvents();
+      expect(service.currentState.status, SyncStatus.idle);
+    });
+
     test(
       'completion send failure keeps the committed CFI authoritative',
       () async {
@@ -581,7 +693,7 @@ void main() {
       expect(service.currentState.errorMessage, contains('network failure'));
     });
 
-    test('execute and position commit failures also return to idle', () async {
+    test('execute failure returns idle but commit failure stays retryable', () async {
       final executeTransport = FakePageSyncTransport()
         ..onlineUsers = [readyUser('user-a')]
         ..failingEvents.add('page_turn_execute');
@@ -614,8 +726,15 @@ void main() {
 
       final committed = await commitService.commitPagePosition('epubcfi(/6/6)');
       expect(committed, isFalse);
-      expect(commitService.currentState.status, SyncStatus.idle);
-      expect(commitService.currentState.errorMessage, contains('synchronize'));
+      expect(commitService.currentState.status, SyncStatus.turning);
+      expect(commitService.currentState.currentRequest, isNotNull);
+      expect(commitService.currentState.errorMessage, contains('retrying'));
+
+      commitTransport.failingEvents.remove('page_position_commit');
+      expect(
+        await commitService.commitPagePosition('epubcfi(/6/6)'),
+        isTrue,
+      );
     });
 
     test('rejects a stale request and broadcasts cancellation', () async {
@@ -644,6 +763,38 @@ void main() {
           (event) =>
               event.event == 'page_turn_cancel' &&
               event.payload['request_id'] == 'stale-request',
+        ),
+        isTrue,
+      );
+    });
+
+    test('rejects a request from another reading session', () async {
+      final transport = FakePageSyncTransport()
+        ..onlineUsers = [readyUser('user-a'), readyUser('user-b')];
+      final service = createService(
+        transport,
+        userId: 'user-b',
+        nickname: 'Bob',
+        currentCfi: cfi,
+      );
+      addTearDown(() async {
+        await service.dispose();
+        await transport.dispose();
+      });
+
+      final payload = requestPayload(
+        requestId: 'other-session-request',
+        fromCfi: cfi,
+      )..['session_id'] = 'session-2';
+      transport.emit('page_turn_request', payload);
+      await flushEvents();
+
+      expect(service.currentState.currentRequest, isNull);
+      expect(
+        transport.sentEvents.any(
+          (event) =>
+              event.event == 'page_turn_cancel' &&
+              event.payload['request_id'] == 'other-session-request',
         ),
         isTrue,
       );
@@ -762,6 +913,11 @@ PageSyncService createService(
     transport: transport,
     currentUserId: userId,
     currentNickname: nickname,
+    readingSessionId: 'session-1',
+    expectedParticipantUserIds: transport.onlineUsers
+        .map((user) => user['user_id'])
+        .whereType<String>()
+        .toSet(),
     requestTimeout: requestTimeout,
   );
   service.updateReaderContext(isReady: true, currentCfi: currentCfi);
@@ -783,6 +939,7 @@ Map<String, dynamic> requestPayload({
   DateTime? requestedAt,
 }) {
   return {
+    'session_id': 'session-1',
     'request_id': requestId,
     'user_id': 'user-a',
     'nickname': 'Alice',

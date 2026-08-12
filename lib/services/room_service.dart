@@ -4,6 +4,24 @@ import '../models/room.dart';
 import '../models/room_member.dart';
 import 'supabase_service.dart';
 
+class RoomSessionRevokedException implements Exception {
+  final String message;
+
+  const RoomSessionRevokedException(this.message);
+
+  @override
+  String toString() => message;
+}
+
+class RoomSessionChangedException implements Exception {
+  final String roomId;
+
+  const RoomSessionChangedException(this.roomId);
+
+  @override
+  String toString() => 'Room session changed before CFI could be saved';
+}
+
 class RoomService {
   SupabaseQuerySchema get _database => SupabaseService.database;
 
@@ -87,14 +105,27 @@ class RoomService {
     required String roomId,
     required String cfi,
   }) async {
-    final roomData = await _database
-        .from('rooms')
-        .update({'current_cfi': cfi})
-        .eq('id', roomId)
-        .select()
-        .single();
-
-    return Room.fromJson(roomData);
+    try {
+      final roomData = await _database
+          .from('rooms')
+          .update({'current_cfi': cfi})
+          .eq('id', roomId)
+          .select()
+          .maybeSingle();
+      if (roomData == null) {
+        throw const RoomSessionRevokedException(
+          'This room membership is inactive or has expired.',
+        );
+      }
+      return Room.fromJson(roomData);
+    } on PostgrestException catch (error) {
+      if (error.code == '42501' || error.code == 'P0002') {
+        throw const RoomSessionRevokedException(
+          'This room membership is inactive or has expired.',
+        );
+      }
+      rethrow;
+    }
   }
 
   Future<Map<String, dynamic>> leaveRoom({required String roomId}) async {
@@ -106,12 +137,21 @@ class RoomService {
   }
 
   Future<Room> heartbeatRoom(String roomId) async {
-    final roomData = await _database.rpc(
-      'heartbeat_room',
-      params: {'p_room_id': roomId},
-    ).single();
+    try {
+      final roomData = await _database.rpc(
+        'heartbeat_room',
+        params: {'p_room_id': roomId},
+      ).single();
 
-    return Room.fromJson(roomData);
+      return Room.fromJson(roomData);
+    } on PostgrestException catch (error) {
+      if (error.code == '42501' || error.code == 'P0002') {
+        throw const RoomSessionRevokedException(
+          'This room membership is inactive or has expired.',
+        );
+      }
+      rethrow;
+    }
   }
 
   Future<Room?> getRoom(String roomId) async {
