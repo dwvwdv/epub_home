@@ -1,8 +1,11 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'config/supabase_config.dart';
 import 'config/theme.dart';
 import 'providers/auth_provider.dart';
+import 'providers/presence_provider.dart';
 import 'router/app_router.dart';
 
 class CoTimeBookApp extends ConsumerStatefulWidget {
@@ -12,11 +15,35 @@ class CoTimeBookApp extends ConsumerStatefulWidget {
   ConsumerState<CoTimeBookApp> createState() => _CoTimeBookAppState();
 }
 
-class _CoTimeBookAppState extends ConsumerState<CoTimeBookApp> {
+class _CoTimeBookAppState extends ConsumerState<CoTimeBookApp>
+    with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _initAuth();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final isActive = state == AppLifecycleState.resumed;
+    // Backgrounding is not leaving a room. Only make the transient Presence
+    // reading/ready flags accurate; DB membership expiry is server-owned.
+    unawaited(_updateTransientPresence(isActive));
+  }
+
+  Future<void> _updateTransientPresence(bool isActive) async {
+    try {
+      await ref.read(presenceProvider.notifier).setAppActive(isActive);
+    } catch (error) {
+      debugPrint('Unable to update app lifecycle Presence: $error');
+    }
   }
 
   Future<void> _initAuth() async {

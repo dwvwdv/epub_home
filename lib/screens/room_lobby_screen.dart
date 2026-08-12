@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'package:collection/collection.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -25,7 +26,13 @@ class _RoomLobbyScreenState extends ConsumerState<RoomLobbyScreen> {
   StreamSubscription? _transferSub;
   StreamSubscription? _bookSharedSub;
   StreamSubscription? _startReadingSub;
+  StreamSubscription? _membershipChangedSub;
+  StreamSubscription? _roomClosedSub;
   TransferState _transferState = const TransferState.idle();
+  bool _isInitializing = true;
+  bool _isLeaving = false;
+  bool _isNavigatingToReader = false;
+  String? _initError;
 
   @override
   void initState() {
@@ -33,71 +40,178 @@ class _RoomLobbyScreenState extends ConsumerState<RoomLobbyScreen> {
     WidgetsBinding.instance.addPostFrameCallback((_) => _initRoom());
   }
 
-  void _initRoom() {
-    final authState = ref.read(authProvider);
-    if (!authState.isAuthenticated) return;
+  Future<void> _initRoom() async {
+    try {
+      await _cancelScreenSubscriptions();
+      final authState = await _waitForAuthentication();
+      if (!mounted) return;
 
-    final userId = authState.userId!;
-    final nickname = authState.nickname;
-
-    // Join presence (not reading, just in lobby).
-    ref.read(presenceProvider.notifier).joinRoom(
-          roomCode: widget.roomCode,
-          userId: userId,
-          nickname: nickname,
-          avatarColorIndex: 0,
-          isReading: false,
+      final roomState = ref.read(roomProvider);
+      final room = roomState.currentRoom;
+      if (room == null) {
+        throw StateError('This room is not available on this device.');
+      }
+      if (room.code.toUpperCase() != widget.roomCode.toUpperCase()) {
+        throw StateError(
+          'Room link ${widget.roomCode.toUpperCase()} does not match your '
+          'active room ${room.code}.',
         );
+      }
 
-    // Initialize file transfer service
-    final realtimeService = ref.read(realtimeServiceProvider);
-    ref.read(bookProvider.notifier).initTransferService(
-          realtimeService: realtimeService,
-          currentUserId: userId,
-        );
+      final userId = authState.userId!;
+      final nickname = authState.nickname;
 
-    // Listen to transfer state
-    final transferService = ref.read(bookProvider.notifier).transferService;
-    _transferSub = transferService?.stateStream.listen((state) {
+      if (room.currentBookHash != null &&
+          !ref.read(bookProvider.notifier).hasBook(room.currentBookHash!)) {
+        await ref
+            .read(bookProvider.notifier)
+            .loadExistingBook(room.currentBookHash!);
+      }
+
+      final ownMember = roomState.members
+          .where((member) => member.userId == userId)
+          .firstOrNull;
+
+      final realtimeService = ref.read(realtimeServiceProvider);
+      await ref
+          .read(bookProvider.notifier)
+          .initTransferService(
+            realtimeService: realtimeService,
+            currentUserId: userId,
+            roomCode: room.code,
+          );
+
+      final transferService = ref.read(bookProvider.notifier).transferService;
+      _transferState =
+          transferService?.currentState ?? const TransferState.idle();
+      _transferSub = transferService?.stateStream.listen((state) {
+        if (mounted) setState(() => _transferState = state);
+      });
+
+      // Listen for book_shared events
+      _bookSharedSub = realtimeService.broadcastStream('book_shared').listen((
+        payload,
+      ) {
+        final bookHash = payload['file_hash'] as String?;
+        final bookTitle = payload['title'] as String?;
+        if (bookHash != null) {
+          unawaited(
+            ref.read(bookProvider.notifier).prepareForSharedBook(bookHash),
+          );
+          ref
+              .read(roomProvider.notifier)
+              .onBookSharedReceived(
+                bookTitle: bookTitle ?? 'Unknown',
+                bookHash: bookHash,
+              );
+        }
+      });
+
+      _roomClosedSub = realtimeService.broadcastStream('room_closed').listen((
+        _,
+      ) {
+        if (mounted) _leaveRoom(reason: 'This room has been closed.');
+      });
+
+      _membershipChangedSub = realtimeService
+          .broadcastStream('membership_changed')
+          .listen((_) {
+            if (!mounted) return;
+            unawaited(_refreshMembersAfterLeaveSignal());
+          });
+
+      // Feature 3: Listen for start_reading broadcast → navigate all members to reader.
+      _startReadingSub = realtimeService
+          .broadcastStream('start_reading')
+          .listen((payload) {
+            if (!mounted || _isNavigatingToReader) return;
+            final currentRoom = ref.read(roomProvider).currentRoom;
+            if (currentRoom == null ||
+                payload['initiated_by'] != currentRoom.hostUserId) {
+              return;
+            }
+            if (currentRoom.currentBookHash == null ||
+                !ref
+                    .read(bookProvider.notifier)
+                    .hasBook(currentRoom.currentBookHash!)) {
+              _showError('The shared book is not ready on this device.');
+              return;
+            }
+            _isNavigatingToReader = true;
+            context.goNamed('reader', pathParameters: {'roomCode': room.code});
+          });
+
+      // Install application listeners before channel subscription. A fast
+      // sender can otherwise deliver the first file chunk between Presence
+      // join and transfer initialization. Joining is idempotent when returning
+      // from the reader and updates the current Presence payload in place.
+      await ref
+          .read(presenceProvider.notifier)
+          .joinRoom(
+            roomCode: room.code,
+            userId: userId,
+            nickname: nickname,
+            avatarColorIndex: ownMember?.avatarColorIndex ?? 0,
+            hasBook:
+                room.currentBookHash != null &&
+                ref.read(bookProvider.notifier).hasBook(room.currentBookHash!),
+            bookHash: room.currentBookHash,
+            isReading: false,
+            readerReady: false,
+          );
+
+      if (mounted) setState(() => _isInitializing = false);
+    } catch (error) {
       if (mounted) {
-        setState(() => _transferState = state);
+        setState(() {
+          _isInitializing = false;
+          _initError = error.toString().replaceFirst('Bad state: ', '');
+        });
       }
-    });
-
-    // Listen for book_shared events
-    _bookSharedSub = realtimeService.broadcastStream('book_shared').listen((payload) {
-      final bookHash = payload['file_hash'] as String?;
-      final bookTitle = payload['title'] as String?;
-      if (bookHash != null) {
-        ref.read(roomProvider.notifier).onBookSharedReceived(
-              bookTitle: bookTitle ?? 'Unknown',
-              bookHash: bookHash,
-            );
-      }
-    });
-
-    // Feature 3: Listen for start_reading broadcast → navigate all members to reader.
-    _startReadingSub =
-        realtimeService.broadcastStream('start_reading').listen((_) {
-      if (mounted) {
-        context.goNamed('reader',
-            pathParameters: {'roomCode': widget.roomCode});
-      }
-    });
-
-    // Check if room already has a book
-    final room = ref.read(roomProvider).currentRoom;
-    if (room?.currentBookHash != null) {
-      ref.read(bookProvider.notifier).loadExistingBook(room!.currentBookHash!);
     }
+  }
+
+  Future<AuthState> _waitForAuthentication() async {
+    for (var attempt = 0; attempt < 100; attempt++) {
+      final authState = ref.read(authProvider);
+      if (authState.isAuthenticated) return authState;
+      if (authState.error != null) throw StateError(authState.error!);
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      if (!mounted) throw StateError('Room initialization was cancelled.');
+    }
+    throw StateError('Authentication timed out. Please return home and retry.');
   }
 
   @override
   void dispose() {
-    _transferSub?.cancel();
-    _bookSharedSub?.cancel();
-    _startReadingSub?.cancel();
+    unawaited(_cancelScreenSubscriptions());
     super.dispose();
+  }
+
+  Future<void> _cancelScreenSubscriptions() async {
+    await Future.wait<void>([
+      if (_transferSub != null) _transferSub!.cancel(),
+      if (_bookSharedSub != null) _bookSharedSub!.cancel(),
+      if (_startReadingSub != null) _startReadingSub!.cancel(),
+      if (_membershipChangedSub != null) _membershipChangedSub!.cancel(),
+      if (_roomClosedSub != null) _roomClosedSub!.cancel(),
+    ]);
+    _transferSub = null;
+    _bookSharedSub = null;
+    _startReadingSub = null;
+    _membershipChangedSub = null;
+    _roomClosedSub = null;
+  }
+
+  Future<void> _refreshMembersAfterLeaveSignal() async {
+    // The leaving client must broadcast before its membership is deleted so
+    // Realtime RLS still authorizes the send. Give the following leave RPC a
+    // short window to commit, then read the authoritative database state.
+    await Future<void>.delayed(const Duration(milliseconds: 200));
+    if (!mounted) return;
+    await ref
+        .read(roomProvider.notifier)
+        .refreshMembers(presenceUsers: ref.read(presenceProvider).onlineUsers);
   }
 
   @override
@@ -112,16 +226,36 @@ class _RoomLobbyScreenState extends ConsumerState<RoomLobbyScreen> {
     ref.listen<PresenceState>(presenceProvider, (previous, next) {
       final notifier = ref.read(roomProvider.notifier);
       notifier.updateMembersFromPresence(next.onlineUsers);
-      if ((previous?.onlineCount ?? 0) != next.onlineCount) {
+      final previousIds = (previous?.onlineUserIds ?? const <String>[]).toSet();
+      final nextIds = next.onlineUserIds.toSet();
+      if (!const SetEquality<String>().equals(previousIds, nextIds)) {
         notifier.refreshMembers(presenceUsers: next.onlineUsers);
       }
     });
 
-    if (room == null) {
-      return const Scaffold(
-        body: Center(child: CircularProgressIndicator()),
+    if (_isInitializing) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+
+    final routeMatchesRoom =
+        room != null &&
+        room.code.toUpperCase() == widget.roomCode.toUpperCase();
+    if (_initError != null || !routeMatchesRoom) {
+      return _buildRouteError(
+        _initError ?? 'This room is no longer available.',
       );
     }
+    final activeRoom = room;
+    final hasCurrentBook =
+        activeRoom.currentBookHash != null &&
+        ref.read(bookProvider.notifier).hasBook(activeRoom.currentBookHash!);
+
+    final canStartReading = _canStartReading(
+      roomState: roomState,
+      presenceState: presenceState,
+      hasLocalBook: hasCurrentBook,
+      currentBookHash: activeRoom.currentBookHash,
+    );
 
     // Feature 2: hardware back → leave room properly.
     return PopScope(
@@ -134,7 +268,7 @@ class _RoomLobbyScreenState extends ConsumerState<RoomLobbyScreen> {
           title: const Text('Room Lobby'),
           leading: IconButton(
             icon: const Icon(Icons.arrow_back),
-            onPressed: _leaveRoom,
+            onPressed: _isLeaving ? null : () => _leaveRoom(),
           ),
         ),
         body: Padding(
@@ -148,7 +282,7 @@ class _RoomLobbyScreenState extends ConsumerState<RoomLobbyScreen> {
                 style: TextStyle(color: Colors.white54, fontSize: 14),
               ),
               const SizedBox(height: 8),
-              RoomCodeDisplay(code: room.code),
+              RoomCodeDisplay(code: activeRoom.code),
               const SizedBox(height: 24),
 
               // Members section
@@ -156,10 +290,7 @@ class _RoomLobbyScreenState extends ConsumerState<RoomLobbyScreen> {
                 children: [
                   const Text(
                     'Members',
-                    style: TextStyle(
-                      fontSize: 18,
-                      fontWeight: FontWeight.bold,
-                    ),
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
                   ),
                   const SizedBox(width: 8),
                   Container(
@@ -193,7 +324,7 @@ class _RoomLobbyScreenState extends ConsumerState<RoomLobbyScreen> {
               TransferProgressWidget(transferState: _transferState),
 
               // Book info
-              if (room.currentBookTitle != null) ...[
+              if (activeRoom.currentBookTitle != null) ...[
                 Container(
                   padding: const EdgeInsets.all(16),
                   decoration: BoxDecoration(
@@ -202,27 +333,24 @@ class _RoomLobbyScreenState extends ConsumerState<RoomLobbyScreen> {
                   ),
                   child: Row(
                     children: [
-                      const Icon(
-                        Icons.menu_book,
-                        color: AppTheme.primaryColor,
-                      ),
+                      const Icon(Icons.menu_book, color: AppTheme.primaryColor),
                       const SizedBox(width: 12),
                       Expanded(
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
                             Text(
-                              room.currentBookTitle!,
+                              activeRoom.currentBookTitle!,
                               style: const TextStyle(
                                 fontWeight: FontWeight.w600,
                               ),
                             ),
                             Text(
-                              bookState.hasBook
+                              hasCurrentBook
                                   ? 'Ready to read'
                                   : 'Receiving book...',
                               style: TextStyle(
-                                color: bookState.hasBook
+                                color: hasCurrentBook
                                     ? Colors.green
                                     : Colors.orange,
                                 fontSize: 12,
@@ -242,7 +370,12 @@ class _RoomLobbyScreenState extends ConsumerState<RoomLobbyScreen> {
                 children: [
                   Expanded(
                     child: OutlinedButton.icon(
-                      onPressed: bookState.isLoading ? null : _shareBook,
+                      onPressed:
+                          _isLeaving ||
+                              bookState.isLoading ||
+                              _transferState.isActive
+                          ? null
+                          : _shareBook,
                       icon: const Icon(Icons.upload_file),
                       label: bookState.isLoading
                           ? const SizedBox(
@@ -261,8 +394,9 @@ class _RoomLobbyScreenState extends ConsumerState<RoomLobbyScreen> {
                   const SizedBox(width: 16),
                   Expanded(
                     child: ElevatedButton.icon(
-                      // Feature 3: Start Reading broadcasts to all members.
-                      onPressed: bookState.hasBook ? _startReading : null,
+                      onPressed: _isLeaving || !canStartReading
+                          ? null
+                          : _startReading,
                       icon: const Icon(Icons.play_arrow),
                       label: const Text('Start Reading'),
                     ),
@@ -275,7 +409,20 @@ class _RoomLobbyScreenState extends ConsumerState<RoomLobbyScreen> {
                 Text(
                   bookState.error!,
                   style: const TextStyle(
-                      color: AppTheme.errorColor, fontSize: 13),
+                    color: AppTheme.errorColor,
+                    fontSize: 13,
+                  ),
+                  textAlign: TextAlign.center,
+                ),
+              ],
+              if (presenceState.error != null) ...[
+                const SizedBox(height: 8),
+                Text(
+                  presenceState.error!,
+                  style: const TextStyle(
+                    color: AppTheme.errorColor,
+                    fontSize: 12,
+                  ),
                   textAlign: TextAlign.center,
                 ),
               ],
@@ -290,34 +437,134 @@ class _RoomLobbyScreenState extends ConsumerState<RoomLobbyScreen> {
     await ref.read(bookProvider.notifier).pickAndShareBook();
   }
 
-  /// Feature 3: Broadcast start_reading so every member navigates to reader.
   Future<void> _startReading() async {
     final realtimeService = ref.read(realtimeServiceProvider);
+    final currentRoom = ref.read(roomProvider).currentRoom;
+    final currentUserId = ref.read(authProvider).userId;
+    if (currentRoom == null || currentRoom.hostUserId != currentUserId) {
+      _showError('Only the room host can start reading.');
+      return;
+    }
+    final currentHash = currentRoom.currentBookHash;
+    final isReady = _canStartReading(
+      roomState: ref.read(roomProvider),
+      presenceState: ref.read(presenceProvider),
+      hasLocalBook:
+          currentHash != null &&
+          ref.read(bookProvider.notifier).hasBook(currentHash),
+      currentBookHash: currentHash,
+    );
+    if (!isReady) {
+      _showError('Wait until every room member is online with this book.');
+      return;
+    }
     try {
       await realtimeService.broadcast(
         event: 'start_reading',
-        payload: {'room_code': widget.roomCode},
+        payload: {'room_code': widget.roomCode, 'initiated_by': currentUserId},
       );
-    } catch (_) {
-      // If broadcast fails, still navigate self.
-    }
-    if (mounted) {
-      context.goNamed('reader', pathParameters: {'roomCode': widget.roomCode});
+      // Broadcast is configured with self=true. The single listener above
+      // performs navigation for host and guests, avoiding host double-nav.
+    } catch (error) {
+      if (mounted) _showError('Unable to start reading: $error');
     }
   }
 
-  Future<void> _leaveRoom() async {
+  bool _canStartReading({
+    required RoomState roomState,
+    required PresenceState presenceState,
+    required bool hasLocalBook,
+    required String? currentBookHash,
+  }) {
+    if (!roomState.isHost ||
+        !hasLocalBook ||
+        !presenceState.isConnected ||
+        !presenceState.hasInitialSync ||
+        currentBookHash == null ||
+        roomState.members.isEmpty) {
+      return false;
+    }
+
+    final onlineById = {
+      for (final user in presenceState.onlineUsers)
+        if (user['user_id'] is String) user['user_id'] as String: user,
+    };
+    return roomState.members.every((member) {
+      final presence = onlineById[member.userId];
+      final readyHashes = presence?['ready_book_hashes'];
+      return presence != null &&
+          presence['has_book'] == true &&
+          readyHashes is List &&
+          readyHashes.contains(currentBookHash);
+    });
+  }
+
+  Widget _buildRouteError(String message) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Room unavailable')),
+      body: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(
+                Icons.meeting_room_outlined,
+                size: 56,
+                color: AppTheme.errorColor,
+              ),
+              const SizedBox(height: 16),
+              Text(message, textAlign: TextAlign.center),
+              const SizedBox(height: 24),
+              ElevatedButton(
+                onPressed: () => context.goNamed('home'),
+                child: const Text('Return Home'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _leaveRoom({String? reason}) async {
+    if (_isLeaving) return;
+    if (mounted) setState(() => _isLeaving = true);
+
+    final errors = <String>[];
     try {
-      await ref.read(presenceProvider.notifier).leaveRoom();
-    } catch (_) {}
+      await ref.read(presenceProvider.notifier).announceLeaving();
+    } catch (error) {
+      // The database leave remains authoritative. Presence sync and the stale
+      // membership cleanup job provide eventual convergence if this hint fails.
+      debugPrint('Unable to announce room departure: $error');
+    }
     try {
       await ref.read(roomProvider.notifier).leaveRoom();
-    } catch (_) {}
+    } catch (error) {
+      errors.add('room membership: $error');
+    }
     try {
-      ref.read(bookProvider.notifier).reset();
-    } catch (_) {}
+      await ref.read(presenceProvider.notifier).leaveRoom();
+    } catch (error) {
+      errors.add('realtime presence: $error');
+    }
+    await ref.read(bookProvider.notifier).reset();
+
     if (mounted) {
+      final message = [
+        if (reason != null) reason,
+        if (errors.isNotEmpty)
+          'Room cleanup needs attention: ${errors.join('; ')}',
+      ].join('\n');
+      if (message.isNotEmpty) _showError(message);
       context.goNamed('home');
     }
+  }
+
+  void _showError(String message) {
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
   }
 }
