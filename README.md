@@ -11,22 +11,23 @@ A collaborative reading app built with Flutter and Supabase.
 
 ### 1. Set Up Supabase Database
 
-You need to create the database tables in your Supabase project:
+The database uses a dedicated `cotime_book` schema. To create or upgrade it:
 
 1. Go to your [Supabase Dashboard](https://app.supabase.com)
 2. Select your project
 3. Click on **SQL Editor** in the left sidebar
 4. Click **New Query**
-5. Copy the entire contents of `supabase/migrations/001_initial_schema.sql`
-6. Paste it into the SQL Editor
-7. Click **Run** to execute the SQL
+5. For a new project, run `supabase/migrations/001_initial_schema.sql`
+6. Run each remaining file in `supabase/migrations/` in filename order
+7. Confirm the `cotime_book` schema is listed under **Data API → Exposed Schemas**
+8. In **Realtime → Settings**, disable **Allow public access to channels**
 
 This will create:
 - `rooms` - Stores reading rooms
 - `room_members` - Tracks who is in each room
 - `profiles` - User profile information
-- Row Level Security (RLS) policies for data access control
-- Realtime subscriptions for live updates
+- Least-privilege grants and Row Level Security (RLS) policies
+- Private Realtime Broadcast and Presence authorization
 
 ### 2. Get Your Supabase Credentials
 
@@ -84,25 +85,12 @@ supabase/
 
 ### Troubleshooting
 
-**Error: "relation 'public.rooms' does not exist"**
-- You need to run the SQL migration file in Supabase (see step 1 above)
+**Error: "The schema must be one of the following: public"**
+- Run the latest migration and reload the Data API configuration
+- Confirm `cotime_book` is in **Data API → Exposed Schemas**
 
-**Error: "infinite recursion detected in policy for relation 'room_members'"**
-- This means you ran an old version of the migration file
-- Solution: In Supabase SQL Editor, run:
-  ```sql
-  DROP POLICY IF EXISTS "Room members can read members" ON room_members;
-  ```
-- Then re-run the entire `001_initial_schema.sql` file, or just run:
-  ```sql
-  CREATE POLICY "Anyone can read members of active rooms"
-    ON room_members FOR SELECT
-    USING (
-      room_id IN (
-        SELECT id FROM rooms WHERE is_active = true
-      )
-    );
-  ```
+**Error: "relation 'cotime_book.rooms' does not exist"**
+- You need to run the SQL migration file in Supabase (see step 1 above)
 
 **Error: "Supabase not configured"**
 - Make sure you're running the app with `--dart-define` flags (see step 3 above)
