@@ -19,7 +19,7 @@ class RoomSessionChangedException implements Exception {
   const RoomSessionChangedException(this.roomId);
 
   @override
-  String toString() => 'Room session changed before CFI could be saved';
+  String toString() => 'Room state changed before the update could finish';
 }
 
 class RoomService {
@@ -87,6 +87,7 @@ class RoomService {
     required String roomId,
     required String bookTitle,
     required String bookHash,
+    required int expectedRevision,
   }) async {
     final roomData = await _database
         .from('rooms')
@@ -95,8 +96,13 @@ class RoomService {
           'current_book_hash': bookHash,
         })
         .eq('id', roomId)
+        .eq('revision', expectedRevision)
         .select()
-        .single();
+        .maybeSingle();
+
+    if (roomData == null) {
+      await _throwRoomUpdateFailure(roomId);
+    }
 
     return Room.fromJson(roomData);
   }
@@ -104,18 +110,18 @@ class RoomService {
   Future<Room> updateRoomCfi({
     required String roomId,
     required String cfi,
+    required int expectedRevision,
   }) async {
     try {
       final roomData = await _database
           .from('rooms')
           .update({'current_cfi': cfi})
           .eq('id', roomId)
+          .eq('revision', expectedRevision)
           .select()
           .maybeSingle();
       if (roomData == null) {
-        throw const RoomSessionRevokedException(
-          'This room membership is inactive or has expired.',
-        );
+        await _throwRoomUpdateFailure(roomId);
       }
       return Room.fromJson(roomData);
     } on PostgrestException catch (error) {
@@ -126,6 +132,16 @@ class RoomService {
       }
       rethrow;
     }
+  }
+
+  Future<Never> _throwRoomUpdateFailure(String roomId) async {
+    final currentRoom = await getRoom(roomId);
+    if (currentRoom == null) {
+      throw const RoomSessionRevokedException(
+        'This room membership is inactive or has expired.',
+      );
+    }
+    throw RoomSessionChangedException(roomId);
   }
 
   Future<Map<String, dynamic>> leaveRoom({required String roomId}) async {

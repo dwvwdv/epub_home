@@ -132,6 +132,101 @@ void main() {
       );
       expect(notifier.state.currentRoom?.id, room.id);
       expect(notifier.state.currentRoom?.currentCfi, isNull);
+      expect(service.lastCfiExpectedRevision, 0);
+    });
+
+    test('a delayed member refresh cannot overwrite a later room', () async {
+      final service = FakeRoomService();
+      final notifier = RoomNotifier(service);
+      addTearDown(notifier.dispose);
+
+      await notifier.createRoom('Alice');
+      final delayedMembers = Completer<List<RoomMember>>();
+      service.memberRead = delayedMembers;
+      final refresh = notifier.refreshMembers();
+      await Future<void>.delayed(Duration.zero);
+
+      await notifier.leaveRoom();
+      service.memberRead = null;
+      service.nextRoom = testRoom(id: 'room-b', code: 'BBBBBB');
+      await notifier.createRoom('Alice');
+      delayedMembers.complete([testMember(roomId: 'room-a')]);
+      await refresh;
+
+      expect(notifier.state.currentRoom?.id, 'room-b');
+      expect(notifier.state.members, isEmpty);
+    });
+
+    test('a delayed member snapshot cannot overwrite newer presence', () async {
+      final service = FakeRoomService()
+        ..members = [testMember(roomId: 'room-a')];
+      final notifier = RoomNotifier(service);
+      addTearDown(notifier.dispose);
+
+      await notifier.createRoom('Alice');
+      final delayedMembers = Completer<List<RoomMember>>();
+      service.memberRead = delayedMembers;
+      final refresh = notifier.refreshMembers();
+      await Future<void>.delayed(Duration.zero);
+
+      notifier.updateMembersFromPresence([
+        {
+          'user_id': 'user-a',
+          'has_book': true,
+        },
+      ]);
+      delayedMembers.complete([testMember(roomId: 'room-a')]);
+      await refresh;
+
+      expect(notifier.state.members.single.hasBook, isTrue);
+      expect(notifier.state.members.single.isOnline, isTrue);
+    });
+
+    test('a delayed room refresh cannot resurrect a previous session', () async {
+      final service = FakeRoomService();
+      final notifier = RoomNotifier(service);
+      addTearDown(notifier.dispose);
+
+      final roomA = await notifier.createRoom('Alice');
+      final delayedRoom = Completer<Room?>();
+      service.roomRead = delayedRoom;
+      final refresh = notifier.refreshRoom();
+      await Future<void>.delayed(Duration.zero);
+
+      await notifier.leaveRoom();
+      service.roomRead = null;
+      service.nextRoom = testRoom(id: 'room-b', code: 'BBBBBB');
+      await notifier.createRoom('Alice');
+      delayedRoom.complete(roomA!.copyWith(currentCfi: 'epubcfi(/6/18)'));
+      await refresh;
+
+      expect(notifier.state.currentRoom?.id, 'room-b');
+      expect(notifier.state.currentRoom?.currentCfi, isNull);
+    });
+
+    test('a delayed room snapshot cannot overwrite a newer local event', () async {
+      final service = FakeRoomService();
+      final notifier = RoomNotifier(service);
+      addTearDown(notifier.dispose);
+
+      final room = await notifier.createRoom('Alice');
+      final delayedRoom = Completer<Room?>();
+      service.roomRead = delayedRoom;
+      final refresh = notifier.refreshRoom();
+      await Future<void>.delayed(Duration.zero);
+
+      notifier.onBookSharedReceived(
+        bookTitle: 'New book',
+        bookHash: List.filled(64, 'a').join(),
+      );
+      delayedRoom.complete(room);
+      await refresh;
+
+      expect(notifier.state.currentRoom?.currentBookTitle, 'New book');
+      expect(
+        notifier.state.currentRoom?.currentBookHash,
+        List.filled(64, 'a').join(),
+      );
     });
   });
 }
@@ -147,17 +242,44 @@ Room testRoom({String id = 'room-a', String code = 'AAAAAA'}) {
   );
 }
 
+RoomMember testMember({required String roomId}) {
+  return RoomMember(
+    id: 'member-a',
+    roomId: roomId,
+    userId: 'user-a',
+    nickname: 'Alice',
+    joinedAt: DateTime.utc(2026, 8, 12),
+  );
+}
+
 class FakeRoomService extends RoomService {
   Room nextRoom = testRoom();
   Object? heartbeatError;
   Object? cfiError;
   Completer<Room>? cfiWrite;
+  Completer<List<RoomMember>>? memberRead;
+  Completer<Room?>? roomRead;
+  int? lastCfiExpectedRevision;
+  List<RoomMember> members = const [];
 
   @override
   Future<Room> createRoom({required String nickname}) async => nextRoom;
 
   @override
-  Future<List<RoomMember>> getRoomMembers(String roomId) async => const [];
+  Future<Room> joinRoom({
+    required String code,
+    required String nickname,
+  }) async => nextRoom;
+
+  @override
+  Future<List<RoomMember>> getRoomMembers(String roomId) async {
+    return memberRead?.future ?? members;
+  }
+
+  @override
+  Future<Room?> getRoom(String roomId) async {
+    return roomRead?.future ?? nextRoom;
+  }
 
   @override
   Future<Room> heartbeatRoom(String roomId) async {
@@ -170,7 +292,9 @@ class FakeRoomService extends RoomService {
   Future<Room> updateRoomCfi({
     required String roomId,
     required String cfi,
+    required int expectedRevision,
   }) async {
+    lastCfiExpectedRevision = expectedRevision;
     final error = cfiError;
     if (error != null) throw error;
     final pending = cfiWrite;

@@ -105,11 +105,12 @@ class RoomNotifier extends StateNotifier<RoomState> {
   }
 
   Future<Room?> createRoom(String nickname) async {
+    final operationGeneration = ++_roomSessionGeneration;
     state = state.copyWith(isLoading: true, error: null);
     try {
       final room = await _roomService.createRoom(nickname: nickname);
       final members = await _roomService.getRoomMembers(room.id);
-      _roomSessionGeneration++;
+      if (_roomSessionGeneration != operationGeneration) return null;
       state = state.copyWith(
         currentRoom: room,
         members: members,
@@ -119,12 +120,15 @@ class RoomNotifier extends StateNotifier<RoomState> {
       _startHeartbeat(room.id);
       return room;
     } catch (e) {
-      state = state.copyWith(isLoading: false, error: e.toString());
+      if (_roomSessionGeneration == operationGeneration) {
+        state = state.copyWith(isLoading: false, error: e.toString());
+      }
       return null;
     }
   }
 
   Future<Room?> joinRoom(String code, String nickname) async {
+    final operationGeneration = ++_roomSessionGeneration;
     state = state.copyWith(isLoading: true, error: null);
     try {
       final room = await _roomService.joinRoom(
@@ -132,7 +136,7 @@ class RoomNotifier extends StateNotifier<RoomState> {
         nickname: nickname,
       );
       final members = await _roomService.getRoomMembers(room.id);
-      _roomSessionGeneration++;
+      if (_roomSessionGeneration != operationGeneration) return null;
       state = state.copyWith(
         currentRoom: room,
         members: members,
@@ -142,7 +146,9 @@ class RoomNotifier extends StateNotifier<RoomState> {
       _startHeartbeat(room.id);
       return room;
     } catch (e) {
-      state = state.copyWith(isLoading: false, error: e.toString());
+      if (_roomSessionGeneration == operationGeneration) {
+        state = state.copyWith(isLoading: false, error: e.toString());
+      }
       return null;
     }
   }
@@ -150,15 +156,23 @@ class RoomNotifier extends StateNotifier<RoomState> {
   Future<void> refreshMembers({List<Map<String, dynamic>>? presenceUsers}) async {
     final room = state.currentRoom;
     if (room == null) return;
+    final roomSessionGeneration = _roomSessionGeneration;
+    final originalMembers = state.members;
     try {
       final members = await _roomService.getRoomMembers(room.id);
+      if (!_isCurrentRoomSession(room.id, roomSessionGeneration) ||
+          !identical(state.members, originalMembers)) {
+        return;
+      }
       state = state.copyWith(members: members);
       // Re-apply online status after DB fetch (DB has no isOnline column)
       if (presenceUsers != null && presenceUsers.isNotEmpty) {
         updateMembersFromPresence(presenceUsers);
       }
     } catch (error) {
-      state = state.copyWith(error: error.toString());
+      if (_isCurrentRoomSession(room.id, roomSessionGeneration)) {
+        state = state.copyWith(error: error.toString());
+      }
     }
   }
 
@@ -199,15 +213,19 @@ class RoomNotifier extends StateNotifier<RoomState> {
     final room = state.currentRoom;
     final userId = SupabaseService.currentUserId;
     if (room == null || userId == null) return;
+    final roomSessionGeneration = _roomSessionGeneration;
     try {
       await _roomService.updateMemberBookStatus(
         roomId: room.id,
         userId: userId,
         hasBook: true,
       );
+      if (!_isCurrentRoomSession(room.id, roomSessionGeneration)) return;
       await refreshMembers();
     } catch (error) {
-      state = state.copyWith(error: error.toString());
+      if (_isCurrentRoomSession(room.id, roomSessionGeneration)) {
+        state = state.copyWith(error: error.toString());
+      }
     }
   }
 
@@ -217,12 +235,17 @@ class RoomNotifier extends StateNotifier<RoomState> {
   }) async {
     final room = state.currentRoom;
     if (room == null) return;
+    final roomSessionGeneration = _roomSessionGeneration;
 
     final updatedRoom = await _roomService.updateRoomBook(
       roomId: room.id,
       bookTitle: bookTitle,
       bookHash: bookHash,
+      expectedRevision: room.revision,
     );
+    if (!_isCurrentRoomSession(room.id, roomSessionGeneration)) {
+      throw RoomSessionChangedException(room.id);
+    }
 
     final userId = SupabaseService.currentUserId;
     if (userId != null) {
@@ -232,9 +255,14 @@ class RoomNotifier extends StateNotifier<RoomState> {
         hasBook: true,
       );
     }
+    if (!_isCurrentRoomSession(room.id, roomSessionGeneration)) {
+      throw RoomSessionChangedException(room.id);
+    }
 
-    state = state.copyWith(
-      currentRoom: updatedRoom,
+    _applyRoomUpdate(
+      updatedRoom,
+      originRoom: room,
+      roomSessionGeneration: roomSessionGeneration,
     );
 
     await refreshMembers();
@@ -244,13 +272,20 @@ class RoomNotifier extends StateNotifier<RoomState> {
   Future<void> refreshRoom() async {
     final room = state.currentRoom;
     if (room == null) return;
+    final roomSessionGeneration = _roomSessionGeneration;
     try {
       final updated = await _roomService.getRoom(room.id);
       if (updated != null) {
-        state = state.copyWith(currentRoom: updated);
+        _applyRoomUpdate(
+          updated,
+          originRoom: room,
+          roomSessionGeneration: roomSessionGeneration,
+        );
       }
     } catch (error) {
-      state = state.copyWith(error: error.toString());
+      if (_isCurrentRoomSession(room.id, roomSessionGeneration)) {
+        state = state.copyWith(error: error.toString());
+      }
     }
   }
 
@@ -270,12 +305,14 @@ class RoomNotifier extends StateNotifier<RoomState> {
     }
     final roomSessionGeneration = _roomSessionGeneration;
     final readingSessionId = state.readingSessionId;
+    final originRoom = state.currentRoom!;
 
     final Room updatedRoom;
     try {
       updatedRoom = await _roomService.updateRoomCfi(
         roomId: roomId,
         cfi: cfi,
+        expectedRevision: originRoom.revision,
       );
     } on RoomSessionRevokedException catch (error) {
       await _revokeSession(roomId, error.message);
@@ -286,7 +323,12 @@ class RoomNotifier extends StateNotifier<RoomState> {
         state.readingSessionId != readingSessionId) {
       throw RoomSessionChangedException(roomId);
     }
-    state = state.copyWith(currentRoom: updatedRoom, error: null);
+    _applyRoomUpdate(
+      updatedRoom,
+      originRoom: originRoom,
+      roomSessionGeneration: roomSessionGeneration,
+      clearError: true,
+    );
   }
 
   Future<void> heartbeat() async {
@@ -333,17 +375,22 @@ class RoomNotifier extends StateNotifier<RoomState> {
       return;
     }
 
+    final roomSessionGeneration = _roomSessionGeneration;
+    final originRoom = state.currentRoom!;
     _heartbeatInFlight = true;
     try {
       final updatedRoom = await _roomService.heartbeatRoom(roomId);
-      if (state.currentRoom?.id == roomId) {
-        state = state.copyWith(currentRoom: updatedRoom, error: null);
-      }
+      _applyRoomUpdate(
+        updatedRoom,
+        originRoom: originRoom,
+        roomSessionGeneration: roomSessionGeneration,
+        clearError: true,
+      );
     } on RoomSessionRevokedException catch (error) {
       await _revokeSession(roomId, error.message);
       if (rethrowError) rethrow;
     } catch (error) {
-      if (state.currentRoom?.id == roomId) {
+      if (_isCurrentRoomSession(roomId, roomSessionGeneration)) {
         state = state.copyWith(error: error.toString());
       }
       if (rethrowError) rethrow;
@@ -371,7 +418,7 @@ class RoomNotifier extends StateNotifier<RoomState> {
 
   Future<void> leaveRoom() async {
     final room = state.currentRoom;
-    _roomSessionGeneration++;
+    final leavingGeneration = ++_roomSessionGeneration;
     if (room == null) {
       _heartbeatTimer?.cancel();
       _heartbeatTimer = null;
@@ -385,8 +432,38 @@ class RoomNotifier extends StateNotifier<RoomState> {
     try {
       await _roomService.leaveRoom(roomId: room.id);
     } finally {
-      state = const RoomState();
+      if (_roomSessionGeneration == leavingGeneration) {
+        state = const RoomState();
+      }
     }
+  }
+
+  bool _isCurrentRoomSession(String roomId, int roomSessionGeneration) {
+    return _roomSessionGeneration == roomSessionGeneration &&
+        state.currentRoom?.id == roomId;
+  }
+
+  bool _applyRoomUpdate(
+    Room updatedRoom, {
+    required Room originRoom,
+    required int roomSessionGeneration,
+    bool clearError = false,
+  }) {
+    if (!_isCurrentRoomSession(updatedRoom.id, roomSessionGeneration)) {
+      return false;
+    }
+    final currentRoom = state.currentRoom!;
+    final isNewer = updatedRoom.revision > currentRoom.revision;
+    final isUnchangedSnapshot =
+        updatedRoom.revision == currentRoom.revision &&
+        identical(currentRoom, originRoom);
+    if (!isNewer && !isUnchangedSnapshot) return false;
+
+    state = state.copyWith(
+      currentRoom: updatedRoom,
+      error: clearError ? null : state.error,
+    );
+    return true;
   }
 
   void clearError() {
