@@ -79,16 +79,27 @@ class RoomService {
     required String userId,
     required bool hasBook,
   }) async {
-    final updatedMember = await _database
-        .from('room_members')
-        .update({'has_book': hasBook})
-        .eq('room_id', roomId)
-        .eq('user_id', userId)
-        .select('id')
-        .maybeSingle();
+    try {
+      final updatedMember = await _database
+          .from('room_members')
+          .update({'has_book': hasBook})
+          .eq('room_id', roomId)
+          .eq('user_id', userId)
+          .select('id')
+          .maybeSingle();
 
-    if (updatedMember == null) {
-      throw StateError('Room membership is inactive or no longer exists');
+      if (updatedMember == null) {
+        throw const RoomSessionRevokedException(
+          'This room membership is inactive or has expired.',
+        );
+      }
+    } on PostgrestException catch (error) {
+      if (error.code == '42501' || error.code == 'P0002') {
+        throw const RoomSessionRevokedException(
+          'This room membership is inactive or has expired.',
+        );
+      }
+      rethrow;
     }
   }
 
@@ -98,22 +109,31 @@ class RoomService {
     required String bookHash,
     required int expectedRevision,
   }) async {
-    final roomData = await _database
-        .from('rooms')
-        .update({
-          'current_book_title': bookTitle,
-          'current_book_hash': bookHash,
-        })
-        .eq('id', roomId)
-        .eq('revision', expectedRevision)
-        .select()
-        .maybeSingle();
+    try {
+      final roomData = await _database
+          .from('rooms')
+          .update({
+            'current_book_title': bookTitle,
+            'current_book_hash': bookHash,
+          })
+          .eq('id', roomId)
+          .eq('revision', expectedRevision)
+          .select()
+          .maybeSingle();
 
-    if (roomData == null) {
-      await _throwRoomUpdateFailure(roomId);
+      if (roomData == null) {
+        await _throwRoomUpdateFailure(roomId);
+      }
+
+      return Room.fromJson(roomData);
+    } on PostgrestException catch (error) {
+      if (error.code == '42501' || error.code == 'P0002') {
+        throw const RoomSessionRevokedException(
+          'This room membership is inactive or has expired.',
+        );
+      }
+      rethrow;
     }
-
-    return Room.fromJson(roomData);
   }
 
   Future<Room> updateRoomCfi({

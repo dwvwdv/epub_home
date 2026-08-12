@@ -222,6 +222,8 @@ class RoomNotifier extends StateNotifier<RoomState> {
       );
       if (!_isCurrentRoomSession(room.id, roomSessionGeneration)) return;
       await refreshMembers();
+    } on RoomSessionRevokedException catch (error) {
+      await _revokeSession(room.id, error.message);
     } catch (error) {
       if (_isCurrentRoomSession(room.id, roomSessionGeneration)) {
         state = state.copyWith(error: error.toString());
@@ -259,6 +261,9 @@ class RoomNotifier extends StateNotifier<RoomState> {
         );
         writeOrigin = state.currentRoom!;
         if (attempt == 1) rethrow;
+      } on RoomSessionRevokedException catch (error) {
+        await _revokeSession(room.id, error.message);
+        rethrow;
       }
     }
     if (updatedRoom == null) {
@@ -270,11 +275,16 @@ class RoomNotifier extends StateNotifier<RoomState> {
 
     final userId = SupabaseService.currentUserId;
     if (userId != null) {
-      await _roomService.updateMemberBookStatus(
-        roomId: room.id,
-        userId: userId,
-        hasBook: true,
-      );
+      try {
+        await _roomService.updateMemberBookStatus(
+          roomId: room.id,
+          userId: userId,
+          hasBook: true,
+        );
+      } on RoomSessionRevokedException catch (error) {
+        await _revokeSession(room.id, error.message);
+        rethrow;
+      }
     }
     if (!_isCurrentRoomSession(room.id, roomSessionGeneration)) {
       throw RoomSessionChangedException(room.id);
@@ -302,17 +312,24 @@ class RoomNotifier extends StateNotifier<RoomState> {
     final roomSessionGeneration = _roomSessionGeneration;
     try {
       final updated = await _roomService.getRoom(room.id);
-      if (updated != null) {
-        final applied = _applyRoomUpdate(
-          updated,
-          originRoom: room,
-          roomSessionGeneration: roomSessionGeneration,
-        );
-        if (applied ||
-            (_isCurrentRoomSession(room.id, roomSessionGeneration) &&
-                state.currentRoom!.revision > updated.revision)) {
-          return state.currentRoom;
+      if (updated == null) {
+        if (_isCurrentRoomSession(room.id, roomSessionGeneration)) {
+          await _revokeSession(
+            room.id,
+            'This room membership is inactive or has expired.',
+          );
         }
+        return null;
+      }
+      final applied = _applyRoomUpdate(
+        updated,
+        originRoom: room,
+        roomSessionGeneration: roomSessionGeneration,
+      );
+      if (applied ||
+          (_isCurrentRoomSession(room.id, roomSessionGeneration) &&
+              state.currentRoom!.revision > updated.revision)) {
+        return state.currentRoom;
       }
     } catch (error) {
       if (_isCurrentRoomSession(room.id, roomSessionGeneration)) {

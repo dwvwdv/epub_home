@@ -71,6 +71,33 @@ void main() {
       expect(teardownCalls, 1);
     });
 
+    test('revoked book write also tears down the cached session', () async {
+      final service = FakeRoomService()
+        ..bookError =
+            const RoomSessionRevokedException('membership expired');
+      var teardownCalls = 0;
+      final notifier = RoomNotifier(
+        service,
+        onSessionRevoked: () async {
+          teardownCalls++;
+        },
+      );
+      addTearDown(notifier.dispose);
+
+      await notifier.createRoom('Alice');
+      await expectLater(
+        notifier.updateBookShared(
+          bookTitle: 'Revoked Book',
+          bookHash: List.filled(64, 'c').join(),
+        ),
+        throwsA(isA<RoomSessionRevokedException>()),
+      );
+
+      expect(notifier.state.currentRoom, isNull);
+      expect(notifier.state.error, 'membership expired');
+      expect(teardownCalls, 1);
+    });
+
     test('room-specific CFI writes cannot update a later room session', () async {
       final service = FakeRoomService();
       final notifier = RoomNotifier(service);
@@ -247,6 +274,27 @@ void main() {
       expect(notifier.state.currentRoom, same(refreshed));
     });
 
+    test('missing authoritative room snapshot revokes the session', () async {
+      final missingRoom = Completer<Room?>()..complete(null);
+      final service = FakeRoomService()..roomRead = missingRoom;
+      var teardownCalls = 0;
+      final notifier = RoomNotifier(
+        service,
+        onSessionRevoked: () async {
+          teardownCalls++;
+        },
+      );
+      addTearDown(notifier.dispose);
+
+      await notifier.createRoom('Alice');
+      final refreshed = await notifier.refreshRoomAndGet();
+
+      expect(refreshed, isNull);
+      expect(notifier.state.currentRoom, isNull);
+      expect(notifier.state.error, contains('inactive'));
+      expect(teardownCalls, 1);
+    });
+
     test('CFI write refreshes and retries one room revision conflict', () async {
       final service = FakeRoomService()
         ..cfiConflicts = 1
@@ -316,6 +364,7 @@ class FakeRoomService extends RoomService {
   Room nextRoom = testRoom();
   Object? heartbeatError;
   Object? cfiError;
+  Object? bookError;
   Completer<Room>? cfiWrite;
   Completer<List<RoomMember>>? memberRead;
   Completer<Room?>? roomRead;
@@ -383,6 +432,8 @@ class FakeRoomService extends RoomService {
     required int expectedRevision,
   }) async {
     bookExpectedRevisions.add(expectedRevision);
+    final error = bookError;
+    if (error != null) throw error;
     if (bookConflicts > 0) {
       bookConflicts--;
       throw RoomRevisionConflictException(conflictRoom);
