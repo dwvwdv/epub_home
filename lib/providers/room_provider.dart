@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../models/room.dart';
 import '../models/room_member.dart';
@@ -46,7 +48,12 @@ class RoomState {
 }
 
 class RoomNotifier extends StateNotifier<RoomState> {
+  static const heartbeatInterval = Duration(minutes: 5);
+
   final RoomService _roomService;
+  Timer? _heartbeatTimer;
+  bool _heartbeatInFlight = false;
+  bool _appIsActive = true;
 
   RoomNotifier(this._roomService) : super(const RoomState());
 
@@ -60,6 +67,7 @@ class RoomNotifier extends StateNotifier<RoomState> {
         members: members,
         isLoading: false,
       );
+      _startHeartbeat(room.id);
       return room;
     } catch (e) {
       state = state.copyWith(isLoading: false, error: e.toString());
@@ -80,6 +88,7 @@ class RoomNotifier extends StateNotifier<RoomState> {
         members: members,
         isLoading: false,
       );
+      _startHeartbeat(room.id);
       return room;
     } catch (e) {
       state = state.copyWith(isLoading: false, error: e.toString());
@@ -209,33 +218,88 @@ class RoomNotifier extends StateNotifier<RoomState> {
     final room = state.currentRoom;
     if (room == null) return;
 
+    await _sendHeartbeat(room.id, rethrowError: true);
+  }
+
+  void setAppActive(bool isActive) {
+    _appIsActive = isActive;
+    if (!isActive) {
+      _heartbeatTimer?.cancel();
+      _heartbeatTimer = null;
+      return;
+    }
+
+    final roomId = state.currentRoom?.id;
+    if (roomId != null) {
+      _startHeartbeat(roomId, sendImmediately: true);
+    }
+  }
+
+  void _startHeartbeat(String roomId, {bool sendImmediately = false}) {
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = null;
+    if (!_appIsActive) return;
+
+    if (sendImmediately) {
+      unawaited(_sendHeartbeat(roomId));
+    }
+    _heartbeatTimer = Timer.periodic(heartbeatInterval, (_) {
+      unawaited(_sendHeartbeat(roomId));
+    });
+  }
+
+  Future<void> _sendHeartbeat(
+    String roomId, {
+    bool rethrowError = false,
+  }) async {
+    if (_heartbeatInFlight ||
+        !_appIsActive ||
+        state.currentRoom?.id != roomId) {
+      return;
+    }
+
+    _heartbeatInFlight = true;
     try {
-      final updatedRoom = await _roomService.heartbeatRoom(room.id);
-      state = state.copyWith(currentRoom: updatedRoom, error: null);
+      final updatedRoom = await _roomService.heartbeatRoom(roomId);
+      if (state.currentRoom?.id == roomId) {
+        state = state.copyWith(currentRoom: updatedRoom, error: null);
+      }
     } catch (error) {
-      state = state.copyWith(error: error.toString());
-      rethrow;
+      if (state.currentRoom?.id == roomId) {
+        state = state.copyWith(error: error.toString());
+      }
+      if (rethrowError) rethrow;
+    } finally {
+      _heartbeatInFlight = false;
     }
   }
 
   Future<void> leaveRoom() async {
     final room = state.currentRoom;
     if (room == null) {
+      _heartbeatTimer?.cancel();
+      _heartbeatTimer = null;
       state = const RoomState();
       return;
     }
 
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = null;
     state = state.copyWith(isLoading: true, error: null);
     try {
       await _roomService.leaveRoom(roomId: room.id);
+    } finally {
       state = const RoomState();
-    } catch (error) {
-      state = state.copyWith(isLoading: false, error: error.toString());
-      rethrow;
     }
   }
 
   void clearError() {
     state = state.copyWith(error: null);
+  }
+
+  @override
+  void dispose() {
+    _heartbeatTimer?.cancel();
+    super.dispose();
   }
 }

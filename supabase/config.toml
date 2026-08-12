@@ -1,0 +1,13 @@
+project_id = "cotime-book"
+
+[api]
+enabled = true
+schemas = ["public", "graphql_public", "cotime_book"]
+extra_search_path = ["public", "extensions"]
+
+[db]
+# Match production so local migration replay catches PostgreSQL 15 behavior.
+major_version = 15
+
+[db.seed]
+enabled = false

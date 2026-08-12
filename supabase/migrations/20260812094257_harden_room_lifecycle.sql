@@ -30,7 +30,6 @@ alter default privileges for role postgres in schema cotime_book_private
 
 alter table cotime_book.rooms
   add column if not exists channel_id uuid,
-  add column if not exists channel_secret text,
   add column if not exists closed_at timestamptz,
   add column if not exists expires_at timestamptz,
   add column if not exists last_activity_at timestamptz,
@@ -77,10 +76,6 @@ set created_at = coalesce(created_at, now()),
     updated_at = coalesce(updated_at, created_at, now()),
     is_active = coalesce(is_active, false),
     channel_id = coalesce(channel_id, extensions.gen_random_uuid()),
-    channel_secret = coalesce(
-      channel_secret,
-      encode(extensions.gen_random_bytes(32), 'hex')
-    ),
     last_activity_at = coalesce(last_activity_at, updated_at, created_at, now()),
     revision = greatest(coalesce(revision, 0), 0);
 
@@ -92,7 +87,9 @@ set closed_at = case
     expires_at = case
       when is_active then coalesce(
         expires_at,
-        last_activity_at + interval '24 hours'
+        -- Legacy clients do not heartbeat. Give rooms that predate this
+        -- migration one deployment window before automatic cleanup begins.
+        now() + interval '24 hours'
       )
       else coalesce(expires_at, closed_at, updated_at, now())
     end;
@@ -112,7 +109,10 @@ set nickname = case
     avatar_color_index = least(greatest(coalesce(avatar_color_index, 0), 0), 7),
     has_book = coalesce(has_book, false),
     joined_at = coalesce(joined_at, now()),
-    last_seen_at = coalesce(last_seen_at, joined_at, now()),
+    -- Existing app versions do not heartbeat. A future timestamp is a
+    -- one-time rollout grace; the first new-client heartbeat replaces it with
+    -- the real observation time and normal 30-minute eviction resumes.
+    last_seen_at = coalesce(last_seen_at, now() + interval '24 hours'),
     ready_book_hash = case
       when ready_book_hash ~ '^[0-9a-fA-F]{64}$' then lower(ready_book_hash)
       else null
@@ -255,8 +255,6 @@ alter table cotime_book.rooms
   alter column updated_at set default now(),
   alter column channel_id set not null,
   alter column channel_id set default extensions.gen_random_uuid(),
-  alter column channel_secret set not null,
-  alter column channel_secret set default encode(extensions.gen_random_bytes(32), 'hex'),
   alter column expires_at set not null,
   alter column expires_at set default (now() + interval '24 hours'),
   alter column last_activity_at set not null,
@@ -280,8 +278,6 @@ alter table cotime_book.room_members
 alter table cotime_book.rooms
   add constraint rooms_code_format
     check (code ~ '^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{6}$'),
-  add constraint rooms_channel_secret_format
-    check (channel_secret ~ '^[0-9a-f]{64}$'),
   add constraint rooms_current_book_hash_format
     check (
       current_book_hash is null
@@ -316,10 +312,10 @@ alter table cotime_book.room_members
 
 create unique index if not exists rooms_channel_id_key
   on cotime_book.rooms (channel_id);
-create unique index if not exists rooms_channel_secret_key
-  on cotime_book.rooms (channel_secret);
 create unique index if not exists room_members_one_room_per_user
   on cotime_book.room_members (user_id);
+create index if not exists room_members_last_seen_idx
+  on cotime_book.room_members (last_seen_at, room_id, user_id);
 create index if not exists room_members_room_joined_idx
   on cotime_book.room_members (room_id, joined_at, id);
 create index if not exists rooms_host_user_id_idx
@@ -378,7 +374,9 @@ $$;
 
 create or replace function cotime_book_private.remove_membership_locked(
   target_room_id uuid,
-  target_user_id uuid
+  target_user_id uuid,
+  action_at timestamptz default now(),
+  touch_activity boolean default false
 )
 returns jsonb
 language plpgsql
@@ -392,6 +390,11 @@ declare
   current_host uuid;
   room_closed boolean := false;
 begin
+  if action_at is null or touch_activity is null then
+    raise exception 'Membership removal options are required'
+      using errcode = '22023';
+  end if;
+
   -- Callers lock rooms in UUID order. Re-locking an already held row is safe and
   -- protects this helper if it is reused by another privileged function.
   perform 1
@@ -427,25 +430,37 @@ begin
   if replacement_host is null then
     update cotime_book.rooms
     set is_active = false,
-        closed_at = coalesce(closed_at, now()),
-        expires_at = least(expires_at, now()),
-        updated_at = now(),
+        closed_at = coalesce(closed_at, action_at),
+        expires_at = least(expires_at, action_at),
+        updated_at = action_at,
         revision = revision + 1
     where id = target_room_id;
     room_closed := true;
   elsif leaving_host then
     update cotime_book.rooms
     set host_user_id = replacement_host,
-        last_activity_at = now(),
-        expires_at = now() + interval '24 hours',
-        updated_at = now(),
+        last_activity_at = case
+          when touch_activity then action_at
+          else last_activity_at
+        end,
+        expires_at = case
+          when touch_activity then action_at + interval '24 hours'
+          else expires_at
+        end,
+        updated_at = action_at,
         revision = revision + 1
     where id = target_room_id;
   else
     update cotime_book.rooms
-    set last_activity_at = now(),
-        expires_at = now() + interval '24 hours',
-        updated_at = now(),
+    set last_activity_at = case
+          when touch_activity then action_at
+          else last_activity_at
+        end,
+        expires_at = case
+          when touch_activity then action_at + interval '24 hours'
+          else expires_at
+        end,
+        updated_at = action_at,
         revision = revision + 1
     where id = target_room_id
       and is_active = true;
@@ -710,16 +725,6 @@ begin
   where id = p_room_id
   for update;
 
-  if not exists (
-    select 1
-    from cotime_book.room_members
-    where room_id = p_room_id
-      and user_id = current_user_id
-  ) then
-    raise exception 'Current user is not a member of this room'
-      using errcode = '42501';
-  end if;
-
   leave_result := cotime_book_private.remove_membership_locked(
     p_room_id,
     current_user_id
@@ -778,10 +783,11 @@ begin
 end;
 $$;
 
-create or replace function cotime_book.cleanup_expired_rooms(
+create or replace function cotime_book_private.cleanup_expired_rooms(
   p_now timestamptz default now(),
   p_inactive_retention interval default interval '30 days',
-  p_limit integer default 100
+  p_limit integer default 100,
+  p_member_stale_after interval default interval '30 minutes'
 )
 returns jsonb
 language plpgsql
@@ -791,6 +797,10 @@ as $$
 declare
   expired_room_ids uuid[] := array[]::uuid[];
   purge_room_ids uuid[] := array[]::uuid[];
+  stale_room_id uuid;
+  stale_user_id uuid;
+  removal_result jsonb;
+  stale_member_count integer := 0;
   closed_count integer := 0;
   deleted_count integer := 0;
 begin
@@ -804,6 +814,11 @@ begin
   if p_inactive_retention is null
      or p_inactive_retention < interval '1 day' then
     raise exception 'Inactive retention must be at least one day'
+      using errcode = '22023';
+  end if;
+  if p_member_stale_after is null
+     or p_member_stale_after < interval '15 minutes' then
+    raise exception 'Member stale interval must be at least 15 minutes'
       using errcode = '22023';
   end if;
 
@@ -831,6 +846,45 @@ begin
   delete from cotime_book.room_members
   where room_id = any(expired_room_ids);
 
+  -- Serialize stale-member eviction on the same parent lock used by heartbeat,
+  -- join, and explicit leave. A heartbeat committed before this lock refreshes
+  -- last_seen_at; one arriving afterwards observes the removed membership.
+  for stale_room_id in
+    select room.id
+    from cotime_book.rooms as room
+    where room.is_active = true
+      and exists (
+        select 1
+        from cotime_book.room_members as member
+        where member.room_id = room.id
+          and member.last_seen_at <= p_now - p_member_stale_after
+      )
+    order by room.id
+    for update skip locked
+    limit p_limit
+  loop
+    for stale_user_id in
+      select member.user_id
+      from cotime_book.room_members as member
+      where member.room_id = stale_room_id
+        and member.last_seen_at <= p_now - p_member_stale_after
+      order by member.joined_at, member.user_id
+    loop
+      removal_result := cotime_book_private.remove_membership_locked(
+        stale_room_id,
+        stale_user_id,
+        p_now,
+        false
+      );
+      if (removal_result ->> 'removed')::boolean then
+        stale_member_count := stale_member_count + 1;
+      end if;
+      if (removal_result ->> 'room_closed')::boolean then
+        closed_count := closed_count + 1;
+      end if;
+    end loop;
+  end loop;
+
   select coalesce(array_agg(purge.id), array[]::uuid[])
   into purge_room_ids
   from (
@@ -848,6 +902,7 @@ begin
   get diagnostics deleted_count = row_count;
 
   return jsonb_build_object(
+    'stale_members_removed', stale_member_count,
     'closed_rooms', closed_count,
     'deleted_rooms', deleted_count
   );
@@ -864,9 +919,9 @@ begin
   if new.current_book_hash is distinct from old.current_book_hash then
     update cotime_book.room_members
     set has_book = false,
-        ready_book_hash = null,
-        last_seen_at = now()
-    where room_id = old.id;
+        ready_book_hash = null
+    where room_id = old.id
+      and (has_book = true or ready_book_hash is not null);
   end if;
 
   new.updated_at := now();
@@ -891,7 +946,6 @@ security definer
 set search_path = ''
 as $$
 begin
-  new.last_seen_at := now();
   if new.has_book is distinct from old.has_book then
     if new.has_book then
       select room.current_book_hash
@@ -985,6 +1039,16 @@ drop function if exists cotime_book.can_access_room_topic(text);
 
 revoke all on all functions in schema cotime_book_private
   from public, anon, authenticated, service_role;
+
+-- These helpers are referenced from RLS policies. PostgreSQL still checks
+-- EXECUTE at policy evaluation time, while the private schema remains outside
+-- PostgREST's exposed schemas so neither helper becomes a Data API RPC.
+grant usage on schema cotime_book_private to authenticated;
+grant execute on function cotime_book_private.is_active_room_member(uuid)
+  to authenticated;
+grant execute on function cotime_book_private.can_access_room_topic(text)
+  to authenticated;
+
 revoke all on function cotime_book.create_room(text, integer)
   from public, anon, authenticated, service_role;
 revoke all on function cotime_book.join_room(text, text, integer)
@@ -993,12 +1057,6 @@ revoke all on function cotime_book.leave_room(uuid)
   from public, anon, authenticated, service_role;
 revoke all on function cotime_book.heartbeat_room(uuid)
   from public, anon, authenticated, service_role;
-revoke all on function cotime_book.cleanup_expired_rooms(
-  timestamptz,
-  interval,
-  integer
-) from public, anon, authenticated, service_role;
-
 grant execute on function cotime_book.create_room(text, integer)
   to authenticated, service_role;
 grant execute on function cotime_book.join_room(text, text, integer)
@@ -1007,18 +1065,30 @@ grant execute on function cotime_book.leave_room(uuid)
   to authenticated, service_role;
 grant execute on function cotime_book.heartbeat_room(uuid)
   to authenticated, service_role;
-grant execute on function cotime_book.cleanup_expired_rooms(
-  timestamptz,
-  interval,
-  integer
-) to service_role;
+-- Supabase Cron runs in the database as postgres. Use a project-specific named
+-- job so a repeated migration/recovery updates only this app's schedule.
+create extension if not exists pg_cron with schema pg_catalog;
+grant usage on schema cron to postgres;
+grant all privileges on all tables in schema cron to postgres;
 
--- Close already-expired rooms and purge inactive rooms beyond retention now.
--- Historical room codes remain in room_code_reservations.
-select cotime_book.cleanup_expired_rooms(
-  now(),
-  interval '30 days',
-  10000
-);
+do $cron_schedule$
+declare
+  existing_job_id bigint;
+begin
+  for existing_job_id in
+    select job.jobid
+    from cron.job as job
+    where job.jobname = 'cotime_book-room-lifecycle'
+  loop
+    perform cron.unschedule(existing_job_id);
+  end loop;
+
+  perform cron.schedule(
+    'cotime_book-room-lifecycle',
+    '*/10 * * * *',
+    'select cotime_book_private.cleanup_expired_rooms();'
+  );
+end
+$cron_schedule$;
 
 notify pgrst, 'reload schema';

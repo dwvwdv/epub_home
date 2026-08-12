@@ -3,7 +3,6 @@ class Room {
   final String code;
   final String hostUserId;
   final String? channelId;
-  final String? channelSecret;
   final String? currentBookTitle;
   final String? currentBookHash;
   final String? currentCfi;
@@ -20,7 +19,6 @@ class Room {
     required this.code,
     required this.hostUserId,
     this.channelId,
-    this.channelSecret,
     this.currentBookTitle,
     this.currentBookHash,
     this.currentCfi,
@@ -39,7 +37,6 @@ class Room {
       code: json['code'] as String,
       hostUserId: json['host_user_id'] as String,
       channelId: json['channel_id'] as String?,
-      channelSecret: json['channel_secret'] as String?,
       currentBookTitle: json['current_book_title'] as String?,
       currentBookHash: json['current_book_hash'] as String?,
       currentCfi: json['current_cfi'] as String?,
@@ -65,7 +62,6 @@ class Room {
       'code': code,
       'host_user_id': hostUserId,
       'channel_id': channelId,
-      'channel_secret': channelSecret,
       'current_book_title': currentBookTitle,
       'current_book_hash': currentBookHash,
       'current_cfi': currentCfi,
@@ -84,7 +80,6 @@ class Room {
     String? code,
     String? hostUserId,
     String? channelId,
-    String? channelSecret,
     String? currentBookTitle,
     String? currentBookHash,
     String? currentCfi,
@@ -101,7 +96,6 @@ class Room {
       code: code ?? this.code,
       hostUserId: hostUserId ?? this.hostUserId,
       channelId: channelId ?? this.channelId,
-      channelSecret: channelSecret ?? this.channelSecret,
       currentBookTitle: currentBookTitle ?? this.currentBookTitle,
       currentBookHash: currentBookHash ?? this.currentBookHash,
       currentCfi: currentCfi ?? this.currentCfi,
