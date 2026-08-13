@@ -39,6 +39,8 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
   String? _queuedTargetCfi;
   String? _displayingTargetCfi;
   bool _recoveringAuthoritativePosition = false;
+  bool _pendingAuthoritativeCfiSync = false;
+  bool _authoritativeCfiSyncInFlight = false;
   int _positionRecoveryGeneration = 0;
   Future<void> _cfiWriteChain = Future<void>.value();
 
@@ -105,11 +107,7 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
     final freshRoom = ref.read(roomProvider).currentRoom;
     final freshCfi = freshRoom?.currentCfi;
     if (freshCfi != null && freshCfi != _currentCfi && mounted) {
-      final previousCfi = _currentCfi;
-      _currentCfi = freshCfi;
-      // A refused rebuild leaves the viewer on the old position, so keeping
-      // the fresh CFI would make this client advertise a page it is not on.
-      if (!_rebuildViewer()) _currentCfi = previousCfi;
+      _adoptAuthoritativeCfi(freshCfi);
     }
     pageSync.updateReaderContext(
       isReady: _isReaderReady,
@@ -303,6 +301,38 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
     _epubController?.display(cfi: targetCfi);
   }
 
+  /// Moves the viewer onto the database's position.
+  ///
+  /// A refused rebuild leaves the viewer on the old page, so keeping the fresh
+  /// CFI would make this client advertise a page it is not on. Dropping it
+  /// outright is no better: nothing else re-reads the room, so a later page
+  /// turn would write a position derived from the stale one over the newer
+  /// database value. The retry is therefore deferred until the request that
+  /// blocked the rebuild settles.
+  void _adoptAuthoritativeCfi(String freshCfi) {
+    final previousCfi = _currentCfi;
+    _currentCfi = freshCfi;
+    if (_rebuildViewer()) return;
+    _currentCfi = previousCfi;
+    _pendingAuthoritativeCfiSync = true;
+  }
+
+  Future<void> _syncAuthoritativePosition() async {
+    if (_authoritativeCfiSyncInFlight) return;
+    _authoritativeCfiSyncInFlight = true;
+    try {
+      // Re-read rather than replaying the CFI captured earlier: the request
+      // that blocked the rebuild may itself have advanced the room.
+      await ref.read(roomProvider.notifier).refreshRoom();
+      if (!mounted || _isStoppingPageSync) return;
+      final freshCfi = ref.read(roomProvider).currentRoom?.currentCfi;
+      if (freshCfi == null || freshCfi == _currentCfi) return;
+      _adoptAuthoritativeCfi(freshCfi);
+    } finally {
+      _authoritativeCfiSyncInFlight = false;
+    }
+  }
+
   /// Returns false when a rebuild is refused, leaving the viewer untouched.
   bool _rebuildViewer() {
     if (_isStoppingPageSync ||
@@ -382,6 +412,17 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
     final presenceState = ref.watch(presenceProvider);
     final bookState = ref.watch(bookProvider);
     final prefs = ref.watch(readingPreferencesProvider);
+
+    ref.listen<PageSyncState>(pageSyncProvider, (previous, next) {
+      if (!_pendingAuthoritativeCfiSync ||
+          next.currentRequest != null ||
+          _isStoppingPageSync ||
+          _recoveringAuthoritativePosition) {
+        return;
+      }
+      _pendingAuthoritativeCfiSync = false;
+      unawaited(_syncAuthoritativePosition());
+    });
 
     if (bookState.bookFile == null) {
       // Without a way back this state is a dead end: the reader route has no
