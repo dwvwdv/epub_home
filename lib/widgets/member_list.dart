@@ -23,9 +23,9 @@ class MemberList extends StatelessWidget {
       );
     }
 
+    // The list fills an Expanded slot, so it must scroll on its own: a
+    // shrink-wrapped, unscrollable list silently clipped members past the fold.
     return ListView.builder(
-      shrinkWrap: true,
-      physics: const NeverScrollableScrollPhysics(),
       itemCount: members.length,
       itemBuilder: (context, index) {
         final member = members[index];

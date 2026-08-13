@@ -79,6 +79,8 @@ class RoomNotifier extends StateNotifier<RoomState> {
   bool _appIsActive = true;
   bool _revocationInProgress = false;
   int _roomSessionGeneration = 0;
+  int _membersFetchGeneration = 0;
+  List<Map<String, dynamic>> _lastPresenceUsers = const [];
 
   RoomNotifier(
     this._roomService, {
@@ -106,6 +108,7 @@ class RoomNotifier extends StateNotifier<RoomState> {
 
   Future<Room?> createRoom(String nickname) async {
     final operationGeneration = ++_roomSessionGeneration;
+    _resetMemberTracking();
     state = state.copyWith(isLoading: true, error: null);
     try {
       final room = await _roomService.createRoom(nickname: nickname);
@@ -129,6 +132,7 @@ class RoomNotifier extends StateNotifier<RoomState> {
 
   Future<Room?> joinRoom(String code, String nickname) async {
     final operationGeneration = ++_roomSessionGeneration;
+    _resetMemberTracking();
     state = state.copyWith(isLoading: true, error: null);
     try {
       final room = await _roomService.joinRoom(
@@ -157,40 +161,72 @@ class RoomNotifier extends StateNotifier<RoomState> {
     final room = state.currentRoom;
     if (room == null) return;
     final roomSessionGeneration = _roomSessionGeneration;
-    final originalMembers = state.members;
+    // The database owns the roster; Presence only owns the per-member online
+    // and has_book overlay. Guarding on a fetch generation discards a fetch
+    // that a *newer* fetch has already superseded, while a Presence overlay
+    // applied during the await no longer throws the roster away — that used to
+    // drop a member who joined while this refresh was in flight, because the
+    // same listener re-applies Presence on every event.
+    final fetchGeneration = ++_membersFetchGeneration;
+    if (presenceUsers != null) _lastPresenceUsers = presenceUsers;
     try {
       final members = await _roomService.getRoomMembers(room.id);
       if (!_isCurrentRoomSession(room.id, roomSessionGeneration) ||
-          !identical(state.members, originalMembers)) {
+          fetchGeneration != _membersFetchGeneration) {
         return;
       }
-      state = state.copyWith(members: members);
-      // Re-apply online status after DB fetch (DB has no isOnline column)
-      if (presenceUsers != null && presenceUsers.isNotEmpty) {
-        updateMembersFromPresence(presenceUsers);
-      }
+      state = state.copyWith(
+        members: _applyPresenceOverlay(members, _lastPresenceUsers),
+      );
     } catch (error) {
-      if (_isCurrentRoomSession(room.id, roomSessionGeneration)) {
+      if (_isCurrentRoomSession(room.id, roomSessionGeneration) &&
+          fetchGeneration == _membersFetchGeneration) {
         state = state.copyWith(error: error.toString());
       }
     }
   }
 
   void updateMembersFromPresence(List<Map<String, dynamic>> onlineUsers) {
-    final updatedMembers = state.members.map((member) {
-      final isOnline = onlineUsers.any(
-        (u) => u['user_id'] == member.userId,
-      );
-      final onlineData = onlineUsers.firstWhere(
-        (u) => u['user_id'] == member.userId,
-        orElse: () => {},
-      );
-      return member.copyWith(
-        isOnline: isOnline,
-        hasBook: (onlineData['has_book'] as bool?) ?? member.hasBook,
-      );
-    }).toList();
+    _lastPresenceUsers = onlineUsers;
+    final updatedMembers = _applyPresenceOverlay(state.members, onlineUsers);
+    // Presence fires far more often than it changes anything. Rewriting state
+    // with an identical roster only churns listeners and rebuilds.
+    if (_membersMatch(state.members, updatedMembers)) return;
     state = state.copyWith(members: updatedMembers);
+  }
+
+  List<RoomMember> _applyPresenceOverlay(
+    List<RoomMember> members,
+    List<Map<String, dynamic>> onlineUsers,
+  ) {
+    if (onlineUsers.isEmpty) return members;
+    final onlineById = {
+      for (final user in onlineUsers)
+        if (user['user_id'] is String) user['user_id'] as String: user,
+    };
+    return members.map((member) {
+      final onlineData = onlineById[member.userId];
+      return member.copyWith(
+        isOnline: onlineData != null,
+        hasBook: (onlineData?['has_book'] as bool?) ?? member.hasBook,
+      );
+    }).toList(growable: false);
+  }
+
+  bool _membersMatch(List<RoomMember> a, List<RoomMember> b) {
+    if (a.length != b.length) return false;
+    for (var index = 0; index < a.length; index++) {
+      final left = a[index];
+      final right = b[index];
+      if (left.userId != right.userId ||
+          left.nickname != right.nickname ||
+          left.avatarColorIndex != right.avatarColorIndex ||
+          left.isOnline != right.isOnline ||
+          left.hasBook != right.hasBook) {
+        return false;
+      }
+    }
+    return true;
   }
 
   /// Called on all clients (including receiver) when book_shared broadcast arrives.
@@ -473,6 +509,7 @@ class RoomNotifier extends StateNotifier<RoomState> {
     if (_revocationInProgress || state.currentRoom?.id != roomId) return;
     _revocationInProgress = true;
     _roomSessionGeneration++;
+    _resetMemberTracking();
     _heartbeatTimer?.cancel();
     _heartbeatTimer = null;
     state = RoomState(error: reason);
@@ -489,6 +526,7 @@ class RoomNotifier extends StateNotifier<RoomState> {
   Future<void> leaveRoom() async {
     final room = state.currentRoom;
     final leavingGeneration = ++_roomSessionGeneration;
+    _resetMemberTracking();
     if (room == null) {
       _heartbeatTimer?.cancel();
       _heartbeatTimer = null;
@@ -506,6 +544,13 @@ class RoomNotifier extends StateNotifier<RoomState> {
         state = const RoomState();
       }
     }
+  }
+
+  /// Drops the Presence overlay and invalidates any in-flight roster fetch so
+  /// a previous room cannot bleed into the next one.
+  void _resetMemberTracking() {
+    _membersFetchGeneration++;
+    _lastPresenceUsers = const [];
   }
 
   bool _isCurrentRoomSession(String roomId, int roomSessionGeneration) {

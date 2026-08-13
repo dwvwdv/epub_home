@@ -67,6 +67,37 @@ void main() {
     expect(channels.single.tracked.last['reader_ready'], isTrue);
   });
 
+  test('online users collapse a user with several connections', () async {
+    await _join(service, 'ABC234');
+    channels.single
+      ..emitStatus(RealtimeSubscribeStatus.subscribed)
+      ..presences = [
+        {
+          'user_id': 'alice',
+          'nickname': 'Alice phone',
+          'is_reading': true,
+          'reader_ready': true,
+          'online_at': '2026-08-12T01:00:00Z',
+        },
+        {
+          'user_id': 'alice',
+          'nickname': 'Alice tablet',
+          'is_reading': false,
+          'reader_ready': false,
+          'online_at': '2026-08-12T02:00:00Z',
+        },
+      ];
+    await Future<void>.delayed(Duration.zero);
+
+    final users = service.getOnlineUsers();
+    expect(users, hasLength(1));
+    // A second, idle connection must not make the reader look unready: that
+    // silently removed the user from every other client's page-turn quorum.
+    expect(users.single['is_reading'], isTrue);
+    expect(users.single['reader_ready'], isTrue);
+    expect(users.single['nickname'], 'Alice tablet');
+  });
+
   test('concurrent same-room joins share one channel', () async {
     await Future.wait([
       _join(service, 'AAA234'),

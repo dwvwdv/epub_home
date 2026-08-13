@@ -25,6 +25,10 @@ class ReaderScreen extends ConsumerStatefulWidget {
 }
 
 class _ReaderScreenState extends ConsumerState<ReaderScreen> {
+  /// Caps the authoritative-position recovery poll so a room whose revision
+  /// never advances cannot leave the reader stuck behind its blocking overlay.
+  static const _maxPositionRecoveryAttempts = 10;
+
   EpubController? _epubController;
   String? _currentCfi;
   bool _isReaderReady = false;
@@ -101,8 +105,11 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
     final freshRoom = ref.read(roomProvider).currentRoom;
     final freshCfi = freshRoom?.currentCfi;
     if (freshCfi != null && freshCfi != _currentCfi && mounted) {
+      final previousCfi = _currentCfi;
       _currentCfi = freshCfi;
-      _rebuildViewer();
+      // A refused rebuild leaves the viewer on the old position, so keeping
+      // the fresh CFI would make this client advertise a page it is not on.
+      if (!_rebuildViewer()) _currentCfi = previousCfi;
     }
     pageSync.updateReaderContext(
       isReady: _isReaderReady,
@@ -226,10 +233,16 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
     String? authoritativeCfi;
     final roomNotifier = ref.read(roomProvider.notifier);
 
-    while (mounted &&
-        !_isStoppingPageSync &&
-        recoveryGeneration == _positionRecoveryGeneration &&
-        ref.read(roomProvider).currentRoom?.id == roomId) {
+    // Bounded: a refresh that keeps returning the same revision would
+    // otherwise spin forever with the reader frozen and no way out, because
+    // the overlay that blocks gestures is only cleared after this loop.
+    for (var attempt = 0; attempt < _maxPositionRecoveryAttempts; attempt++) {
+      if (!mounted ||
+          _isStoppingPageSync ||
+          recoveryGeneration != _positionRecoveryGeneration ||
+          ref.read(roomProvider).currentRoom?.id != roomId) {
+        break;
+      }
       final cachedCfi = ref.read(roomProvider).currentRoom?.currentCfi;
       // The requester already received the authoritative row from its
       // successful write even when the following Realtime commit failed.
@@ -243,7 +256,9 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
         authoritativeCfi = refreshedRoom.currentCfi ?? fallbackCfi;
         break;
       }
-      await Future<void>.delayed(const Duration(seconds: 2));
+      if (attempt + 1 < _maxPositionRecoveryAttempts) {
+        await Future<void>.delayed(const Duration(seconds: 2));
+      }
     }
 
     if (!mounted ||
@@ -288,10 +303,11 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
     _epubController?.display(cfi: targetCfi);
   }
 
-  void _rebuildViewer() {
+  /// Returns false when a rebuild is refused, leaving the viewer untouched.
+  bool _rebuildViewer() {
     if (_isStoppingPageSync ||
         ref.read(pageSyncProvider).currentRequest != null) {
-      return;
+      return false;
     }
     _isReaderReady = false;
     ref
@@ -299,6 +315,7 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
         .updateReaderContext(isReady: false, currentCfi: _currentCfi);
     unawaited(ref.read(presenceProvider.notifier).updateReaderReady(false));
     setState(() => _viewerKey++);
+    return true;
   }
 
   Future<void> _commitRequesterPosition(
@@ -367,9 +384,29 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
     final prefs = ref.watch(readingPreferencesProvider);
 
     if (bookState.bookFile == null) {
-      return Scaffold(
-        appBar: AppBar(title: const Text('Reader')),
-        body: const Center(child: Text('No book loaded')),
+      // Without a way back this state is a dead end: the reader route has no
+      // navigation stack to pop, so hardware back leaves the app instead.
+      return PopScope(
+        canPop: false,
+        onPopInvokedWithResult: (didPop, _) {
+          if (!didPop) _returnToLobby();
+        },
+        child: Scaffold(
+          appBar: AppBar(title: const Text('Reader')),
+          body: Center(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Text('No book loaded'),
+                const SizedBox(height: 16),
+                ElevatedButton(
+                  onPressed: _returnToLobby,
+                  child: const Text('Back to Lobby'),
+                ),
+              ],
+            ),
+          ),
+        ),
       );
     }
 
@@ -451,21 +488,24 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
                           ref
                               .read(bookProvider.notifier)
                               .updateCfi(relocatedCfi);
+                          // Presence readiness must match the local reader
+                          // context exactly. Advertising reader_ready=true
+                          // while the viewer has not finished loading puts
+                          // this client in everyone else's quorum, and it then
+                          // rejects the very requests that quorum authorized.
+                          final isReadyNow =
+                              _isReaderReady && _displayingTargetCfi == null;
                           ref
                               .read(pageSyncProvider.notifier)
                               .updateReaderContext(
-                                isReady:
-                                    _isReaderReady &&
-                                    _displayingTargetCfi == null,
+                                isReady: isReadyNow,
                                 currentCfi: relocatedCfi,
                               );
-                          if (_displayingTargetCfi == null) {
-                            unawaited(
-                              ref
-                                  .read(presenceProvider.notifier)
-                                  .updateReaderReady(true),
-                            );
-                          }
+                          unawaited(
+                            ref
+                                .read(presenceProvider.notifier)
+                                .updateReaderReady(isReadyNow),
+                          );
 
                           if (committedTarget != null) {
                             unawaited(
@@ -799,6 +839,11 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
     if (mounted) {
       context.goNamed('lobby', pathParameters: {'roomCode': widget.roomCode});
     }
+  }
+
+  void _returnToLobby() {
+    if (!mounted) return;
+    context.goNamed('lobby', pathParameters: {'roomCode': widget.roomCode});
   }
 
   void _showSyncError(String message) {
