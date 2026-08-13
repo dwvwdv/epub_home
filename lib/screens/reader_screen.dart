@@ -323,9 +323,19 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
     try {
       // Re-read rather than replaying the CFI captured earlier: the request
       // that blocked the rebuild may itself have advanced the room.
-      await ref.read(roomProvider.notifier).refreshRoom();
+      //
+      // Only an authoritative read may move the viewer. refreshRoom() absorbs
+      // network errors, and the cached room is not updated by a *follower*
+      // completing a turn — only the requester writes it — so falling back to
+      // the cache here would rebuild the viewer at a page older than the one
+      // this reader has already displayed.
+      final room = await ref.read(roomProvider.notifier).refreshRoomAndGet();
       if (!mounted || _isStoppingPageSync) return;
-      final freshCfi = ref.read(roomProvider).currentRoom?.currentCfi;
+      if (room == null) {
+        _pendingAuthoritativeCfiSync = true;
+        return;
+      }
+      final freshCfi = room.currentCfi;
       if (freshCfi == null || freshCfi == _currentCfi) return;
       _adoptAuthoritativeCfi(freshCfi);
     } finally {

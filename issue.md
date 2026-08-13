@@ -160,6 +160,29 @@
   2. 或者把相等性判斷從「字串相等」放寬成「spine index 相同」，只用 CFI 字串做顯示。
 - **注意**：這會動到 consensus 的核心判斷，必須先補測試再改。
 
+### [ ] #G 同一使用者多個 reader session 的 readiness 是 OR 合併的
+
+- **檔案**：`lib/services/presence_merge.dart`
+- **問題**：`mergePresenceUsers` 用 `metas.any(...)` 合併 `reader_ready`。
+  如果同一個 user_id 同時有兩個都在讀的 session（真的兩台裝置），其中一台還在載入，
+  合併結果仍然是 ready。其他人的 quorum 把這個 user 算進去、發出請求，
+  那台還沒 ready 的裝置卻會在 `_isValidIncomingRequest` 把它打回票 → 翻頁被取消。
+- **為什麼現在不改**：
+  - OR 對**目前實際會發生**的情況是正確的：重連後殘留的舊 meta 帶著
+    `reader_ready: true`，那是同一個人同一個閱讀狀態，OR 剛好處理對
+    （這正是 #2 修掉的那個 bug）。改成 AND 反而會讓「斷線瞬間殘留一筆
+    `reader_ready: false`」重新變成阻塞。
+  - 真正的多裝置情境在這個 App 幾乎不會發生：auth 是匿名的，每次安裝就是一個新的
+    user_id，兩台裝置不會共用同一個 user_id。
+  - 這個問題的根源跟 **#A 是同一個**：per-connection 的狀態被硬塞進 per-user 的
+    quorum。要修就得一起修，不能只動合併規則。
+- **如果要修**：`reader_ready` 改成「所有 `is_reading == true` 的 meta 都 ready」
+  （沒有任何 reading meta 時為 false），而 `is_reading` 維持 OR。
+  這比「挑一個 canonical session」更正確，但會需要改
+  `test/presence_provider_test.dart` 裡
+  `mergePresenceUsers deduplicates sessions by user_id` 的預期值——
+  那個測試目前把「lobby 的 session 帶著 stale `reader_ready: true`」也算成 ready。
+
 ### [ ] #B `copyWith` 預設會靜默清掉 `error`
 
 - **檔案**：`lib/providers/room_provider.dart`、`lib/providers/book_provider.dart`、
