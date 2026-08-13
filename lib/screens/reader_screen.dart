@@ -279,11 +279,22 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
     final targetCfi = authoritativeCfi;
     ref.read(bookProvider.notifier).updateCfi(targetCfi);
     setState(() => _recoveringAuthoritativePosition = false);
+    // This recovery *is* an authoritative read, so it satisfies a sync that was
+    // deferred earlier. Leaving that flag set left this reader permanently
+    // unready — blocking the whole room's quorum — because the page-sync error
+    // transition happened while recovery was still running, so the listener
+    // skipped it and nothing else would schedule another read.
+    //
+    // Cleared after the display starts, never before: while _displayingTargetCfi
+    // is set the derived readiness is false, so this cannot publish a ready at
+    // the pre-recovery page. onRelocated reopens the gate.
     if (_currentCfi != targetCfi) {
       _displayCommittedPosition(targetCfi);
+      _setPendingAuthoritativeSync(false);
       return;
     }
 
+    _setPendingAuthoritativeSync(false);
     _publishReadiness(currentCfi: targetCfi);
   }
 
