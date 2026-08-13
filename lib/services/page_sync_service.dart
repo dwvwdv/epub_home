@@ -781,7 +781,7 @@ class PageSyncService {
 
     final current = _state.currentRequest;
     final onlineUsers = _transport.getOnlineUsers();
-    _recordEnteredReaders(onlineUsers);
+    _syncParticipantRoster(onlineUsers);
     if (eventType == 'leave') {
       final departedReaders = _enteredReaderParticipantIds.where((userId) {
         return !_isReadingParticipantOnline(userId, onlineUsers);
@@ -793,7 +793,7 @@ class PageSyncService {
     // stayed in the quorum even after disconnecting from the room entirely,
     // which blocked every later page turn for everyone else. Presence absence
     // is observed identically by all clients, so pruning on it keeps the
-    // rosters convergent. Re-entry is restored by _recordEnteredReaders.
+    // rosters convergent. Re-entry is restored by _syncParticipantRoster.
     _expectedParticipantUserIds.removeAll(
       _expectedParticipantUserIds.where((userId) {
         return userId != _currentUserId && !_isInRoom(userId, onlineUsers);
@@ -949,7 +949,7 @@ class PageSyncService {
       );
     }
 
-    _recordEnteredReaders(users);
+    _syncParticipantRoster(users);
     final usersById = {
       for (final user in users)
         if (user['user_id'] is String) user['user_id'] as String: user,
@@ -1013,19 +1013,28 @@ class PageSyncService {
     return 'Waiting for ${names.join(', ')} to become ready';
   }
 
-  void _recordEnteredReaders(List<Map<String, dynamic>> users) {
+  /// Restores every session participant that is present on the room channel.
+  ///
+  /// Absence is the only thing that removes a participant from the quorum, so
+  /// presence has to put them back — otherwise a temporary disconnect would
+  /// shrink the roster permanently and clients would disagree about the quorum
+  /// for every later page turn in the session.
+  ///
+  /// Being on the channel is enough; the participant does not have to be in
+  /// the reader. A participant waiting in the lobby blocks turns whether or
+  /// not their connection happened to blip, which is the same rule applied to
+  /// one that never disconnected at all.
+  void _syncParticipantRoster(List<Map<String, dynamic>> users) {
     for (final user in users) {
       final userId = user['user_id'];
-      if (userId is String &&
-          _sessionParticipantUserIds.contains(userId) &&
-          !_explicitlyLeftParticipantUserIds.contains(userId) &&
-          user['is_reading'] == true) {
+      if (userId is! String ||
+          !_sessionParticipantUserIds.contains(userId) ||
+          _explicitlyLeftParticipantUserIds.contains(userId)) {
+        continue;
+      }
+      _expectedParticipantUserIds.add(userId);
+      if (user['is_reading'] == true) {
         _enteredReaderParticipantIds.add(userId);
-        // A temporary Presence disconnect removes an entered reader from the
-        // active roster so the in-flight turn can finish. Re-add that reader
-        // after reconnection; otherwise clients permanently disagree about the
-        // quorum for every later page turn in the same reading session.
-        _expectedParticipantUserIds.add(userId);
       }
     }
   }

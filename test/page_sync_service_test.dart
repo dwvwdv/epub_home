@@ -1117,6 +1117,45 @@ void main() {
         );
       },
     );
+
+    test(
+      'a lobby participant blocks again after reconnecting to the room',
+      () async {
+        final transport = FakePageSyncTransport()
+          ..onlineUsers = [
+            readyUser('user-a'),
+            {'user_id': 'user-b', 'nickname': 'Bob', 'is_reading': false},
+          ];
+        final service = createService(transport, currentCfi: cfi);
+        addTearDown(() async {
+          await service.dispose();
+          await transport.dispose();
+        });
+
+        transport.onlineUsers = [readyUser('user-a')];
+        transport.emitPresence({'event': 'leave'});
+        await flushEvents();
+
+        // Back on the channel, still in the lobby. A blip must not exempt a
+        // participant that a continuously connected one would not be exempt
+        // from — absence is the only thing that drops them.
+        transport.onlineUsers = [
+          readyUser('user-a'),
+          {'user_id': 'user-b', 'nickname': 'Bob', 'is_reading': false},
+        ];
+        transport.emitPresence({'event': 'sync'});
+        await flushEvents();
+
+        expect(
+          await service.requestPageTurn(
+            direction: PageTurnDirection.next,
+            fromCfi: cfi,
+          ),
+          isFalse,
+        );
+        expect(service.currentState.errorMessage, contains('Bob'));
+      },
+    );
   });
 }
 

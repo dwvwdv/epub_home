@@ -277,7 +277,7 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
       // unconfirmed position revision-retries over whatever the database
       // actually holds. Keep asking until a snapshot answers.
       setState(() => _recoveringAuthoritativePosition = false);
-      _pendingAuthoritativeCfiSync = true;
+      _setPendingAuthoritativeSync(true);
       _scheduleAuthoritativePositionRetry();
       return;
     }
@@ -293,15 +293,31 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
     _restoreReaderReadiness(targetCfi);
   }
 
+  /// True only when this reader's position is known to match the room's.
+  ///
+  /// While an authoritative read is outstanding the displayed page is a guess,
+  /// and a turn taken from a guess revision-retries over whatever the database
+  /// actually holds. Everything that advertises readiness goes through here.
+  bool get _canAdvertiseReady =>
+      !_pendingAuthoritativeCfiSync && !_recoveringAuthoritativePosition;
+
+  /// Rebuilds so the controls gated on [_canAdvertiseReady] follow the flag.
+  void _setPendingAuthoritativeSync(bool isPending) {
+    if (_pendingAuthoritativeCfiSync == isPending) return;
+    _pendingAuthoritativeCfiSync = isPending;
+    if (mounted) setState(() {});
+  }
+
   /// Re-enters the page-turn quorum once this reader's position is confirmed.
   void _restoreReaderReadiness(String confirmedCfi) {
+    final isReadyNow = _isReaderReady && _canAdvertiseReady;
     ref
         .read(pageSyncProvider.notifier)
-        .updateReaderContext(isReady: _isReaderReady, currentCfi: confirmedCfi);
+        .updateReaderContext(isReady: isReadyNow, currentCfi: confirmedCfi);
     unawaited(
       ref
           .read(presenceProvider.notifier)
-          .updateReaderReady(_isReaderReady)
+          .updateReaderReady(isReadyNow)
           .catchError((Object _) {
             // The cached Presence intent remains authoritative locally and is
             // retried by the connection lifecycle after transport recovery.
@@ -346,7 +362,7 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
     _currentCfi = freshCfi;
     if (_rebuildViewer()) return;
     _currentCfi = previousCfi;
-    _pendingAuthoritativeCfiSync = true;
+    _setPendingAuthoritativeSync(true);
   }
 
   Future<void> _syncAuthoritativePosition() async {
@@ -364,11 +380,11 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
       final room = await ref.read(roomProvider.notifier).refreshRoomAndGet();
       if (!mounted || _isStoppingPageSync) return;
       if (room == null) {
-        _pendingAuthoritativeCfiSync = true;
+        _setPendingAuthoritativeSync(true);
         _scheduleAuthoritativePositionRetry();
         return;
       }
-      _pendingAuthoritativeCfiSync = false;
+      _setPendingAuthoritativeSync(false);
       final freshCfi = room.currentCfi;
       if (freshCfi != null && freshCfi != _currentCfi) {
         // The rebuild reloads the viewer, which restores readiness through
@@ -470,7 +486,7 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
           _recoveringAuthoritativePosition) {
         return;
       }
-      _pendingAuthoritativeCfiSync = false;
+      _setPendingAuthoritativeSync(false);
       unawaited(_syncAuthoritativePosition());
     });
 
@@ -547,16 +563,21 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
                         onChaptersLoaded: (chapters) {
                           if (!mounted || _isStoppingPageSync) return;
                           setState(() => _isReaderReady = true);
+                          // A viewer reload does not confirm the position. If
+                          // recovery is still pending, loading a new viewer —
+                          // a theme change, say — must not quietly put this
+                          // client back in the quorum on an unverified page.
+                          final isReadyNow = _canAdvertiseReady;
                           ref
                               .read(pageSyncProvider.notifier)
                               .updateReaderContext(
-                                isReady: true,
+                                isReady: isReadyNow,
                                 currentCfi: _currentCfi,
                               );
                           unawaited(
                             ref
                                 .read(presenceProvider.notifier)
-                                .updateReaderReady(true),
+                                .updateReaderReady(isReadyNow),
                           );
 
                           final targetCfi = _queuedTargetCfi;
@@ -585,7 +606,9 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
                           // this client in everyone else's quorum, and it then
                           // rejects the very requests that quorum authorized.
                           final isReadyNow =
-                              _isReaderReady && _displayingTargetCfi == null;
+                              _isReaderReady &&
+                              _displayingTargetCfi == null &&
+                              _canAdvertiseReady;
                           ref
                               .read(pageSyncProvider.notifier)
                               .updateReaderContext(
@@ -632,7 +655,7 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
                           behavior: HitTestBehavior.opaque,
                           onHorizontalDragEnd: (details) {
                             if (syncState.status != SyncStatus.idle ||
-                                _recoveringAuthoritativePosition ||
+                                !_canAdvertiseReady ||
                                 _displayingTargetCfi != null) {
                               return;
                             }
@@ -677,7 +700,7 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
     final isIdle =
         syncState.status == SyncStatus.idle &&
         _isReaderReady &&
-        !_recoveringAuthoritativePosition &&
+        _canAdvertiseReady &&
         _displayingTargetCfi == null;
 
     return Container(
@@ -735,6 +758,7 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
                 syncState.status == SyncStatus.idle &&
                     syncState.currentRequest == null &&
                     _isReaderReady &&
+                    _canAdvertiseReady &&
                     !_isStoppingPageSync
                 ? _showThemeSettings
                 : null,

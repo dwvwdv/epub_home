@@ -89,7 +89,9 @@
   就會永遠留在 quorum 裡，全房再也翻不了頁。
 - **修法**：Presence 事件時，把完全不在房間頻道上的參與者移出 quorum。
   「不在頻道上」是所有 client 觀察一致的事實，roster 仍然收斂；
-  之後重新進入 reader 會被 `_recordEnteredReaders()` 加回來。
+  只要重新出現在頻道上就會被 `_syncParticipantRoster()` 加回來（不論是否在 reader 裡）——
+  短暫斷線不該讓一個人永久退出 quorum，也不該讓「斷過線的 lobby 參與者」
+  比「一直連著的 lobby 參與者」享有不同待遇。
   仍留在 lobby（有 presence 但 `is_reading: false`）的人依然會擋——這是刻意的，
   但現在訊息會指名是誰（見 #7）。
 - **測試**：`test/page_sync_service_test.dart` →
