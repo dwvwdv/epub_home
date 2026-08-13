@@ -486,7 +486,10 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
           _recoveringAuthoritativePosition) {
         return;
       }
-      _setPendingAuthoritativeSync(false);
+      // The gate stays shut until _syncAuthoritativePosition has a snapshot in
+      // hand. Clearing it here would re-enable the controls for the duration of
+      // the read, and a turn started in that window writes from the very CFI
+      // the read exists to verify. Re-entry is held off by the in-flight flag.
       unawaited(_syncAuthoritativePosition());
     });
 
