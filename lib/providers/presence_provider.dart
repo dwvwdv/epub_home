@@ -57,9 +57,6 @@ class PresenceState {
 }
 
 class PresenceNotifier extends StateNotifier<PresenceState> {
-  /// How long a join announcement waits for the channel to subscribe.
-  static const announceJoinTimeout = Duration(seconds: 10);
-
   final RealtimeService _realtimeService;
   StreamSubscription<Map<String, dynamic>>? _presenceSubscription;
   StreamSubscription<RealtimeConnectionEvent>? _connectionSubscription;
@@ -74,6 +71,7 @@ class PresenceNotifier extends StateNotifier<PresenceState> {
   bool _currentIsReading = false;
   bool _currentReaderReady = false;
   bool _isAppActive = true;
+  bool _hasPendingJoinAnnouncement = false;
 
   PresenceNotifier(this._realtimeService) : super(const PresenceState()) {
     _presenceSubscription = _realtimeService.presenceStream.listen((event) {
@@ -94,6 +92,9 @@ class PresenceNotifier extends StateNotifier<PresenceState> {
         hasInitialSync: hasUsablePresence && state.hasInitialSync,
         error: event.error?.toString(),
       );
+      if (event.status == RealtimeConnectionStatus.connected) {
+        unawaited(_flushJoinAnnouncement());
+      }
     });
   }
 
@@ -193,28 +194,27 @@ class PresenceNotifier extends StateNotifier<PresenceState> {
   ///
   /// [RealtimeService.joinRoom] returns once `subscribe()` has been *called*,
   /// not once the channel is subscribed, so the transport is still connecting
-  /// here. Waiting for the connection is what makes this announcement happen
-  /// at all — sending immediately silently dropped every join.
+  /// here and sending immediately dropped every join silently.
+  ///
+  /// The announcement is therefore queued rather than raced against a timer:
+  /// it is sent on the next connected event and stays queued until it lands or
+  /// the room session is replaced. A slow subscription must not lose it — in
+  /// the same-user rejoin this exists for, lingering metas merge to the same
+  /// user ID, so the lobby's Presence-ID listener sees no change and this is
+  /// the only signal the peers get that the roster grew.
   Future<void> announceJoining() async {
-    if (!await _waitForConnection(announceJoinTimeout)) return;
-    await _announceMembership('joined');
+    _hasPendingJoinAnnouncement = true;
+    await _flushJoinAnnouncement();
   }
 
-  Future<bool> _waitForConnection(Duration timeout) async {
-    if (_realtimeService.isConnected) return true;
-    // firstWhere subscribes synchronously, so re-checking after it is set up
-    // closes the window where the connection lands between the two checks.
-    final connected = _realtimeService.connectionStream
-        .firstWhere(
-          (event) => event.status == RealtimeConnectionStatus.connected,
-        )
-        .then<bool>((_) => true)
-        .catchError((Object _) => false);
-    if (_realtimeService.isConnected) return true;
+  Future<void> _flushJoinAnnouncement() async {
+    if (!_hasPendingJoinAnnouncement || !_realtimeService.isConnected) return;
+    _hasPendingJoinAnnouncement = false;
     try {
-      return await connected.timeout(timeout);
-    } on TimeoutException {
-      return _realtimeService.isConnected;
+      await _announceMembership('joined');
+    } catch (_) {
+      // Re-queue for the next connected event rather than losing the join.
+      _hasPendingJoinAnnouncement = true;
     }
   }
 
@@ -254,6 +254,8 @@ class PresenceNotifier extends StateNotifier<PresenceState> {
   }
 
   void _clearCurrentUser() {
+    // A queued announcement belongs to the room session that queued it.
+    _hasPendingJoinAnnouncement = false;
     _currentRoomCode = null;
     _currentRoomTopicId = null;
     _currentUserId = null;

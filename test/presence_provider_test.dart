@@ -2,7 +2,6 @@ import 'dart:async';
 
 import 'package:cotime_book/providers/presence_provider.dart';
 import 'package:cotime_book/services/realtime_service.dart';
-import 'package:fake_async/fake_async.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
@@ -106,12 +105,11 @@ void main() {
       avatarColorIndex: 1,
     );
 
-    final announced = notifier.announceJoining();
-    await Future<void>.delayed(Duration.zero);
+    await notifier.announceJoining();
     expect(realtime.broadcasts, isEmpty);
 
     realtime.emitConnected();
-    await announced;
+    await Future<void>.delayed(Duration.zero);
 
     // Sending on the still-connecting channel dropped the join silently, and
     // the other clients kept a roster without this member.
@@ -127,30 +125,56 @@ void main() {
     await realtime.close();
   });
 
-  test('a join announcement gives up when the channel never connects', () async {
-    fakeAsync((async) {
-      final realtime = _DeferredConnectionRealtimeService();
-      final notifier = PresenceNotifier(realtime);
-      var completed = false;
+  test('a queued join announcement survives a slow subscription', () async {
+    final realtime = _DeferredConnectionRealtimeService();
+    final notifier = PresenceNotifier(realtime);
 
-      unawaited(
-        notifier
-            .joinRoom(
-              roomCode: 'abc234',
-              userId: 'alice',
-              nickname: 'Alice',
-              avatarColorIndex: 1,
-            )
-            .then((_) => notifier.announceJoining())
-            .then((_) => completed = true),
-      );
+    await notifier.joinRoom(
+      roomCode: 'abc234',
+      userId: 'alice',
+      nickname: 'Alice',
+      avatarColorIndex: 1,
+    );
+    await notifier.announceJoining();
 
-      async.elapse(PresenceNotifier.announceJoinTimeout + const Duration(seconds: 1));
+    // However long the subscription takes, the announcement must not be lost:
+    // on a same-user rejoin the lingering metas merge to one row, so the
+    // Presence-ID listener gives the peers no other signal.
+    realtime.emitReconnecting();
+    await Future<void>.delayed(Duration.zero);
+    expect(realtime.broadcasts, isEmpty);
 
-      expect(completed, isTrue);
-      expect(realtime.broadcasts, isEmpty);
-      notifier.dispose();
-    });
+    realtime.emitConnected();
+    await Future<void>.delayed(Duration.zero);
+
+    expect(realtime.broadcasts.single.payload['action'], 'joined');
+
+    notifier.dispose();
+    await realtime.disposeFake();
+    await realtime.close();
+  });
+
+  test('a queued join announcement is dropped when the room is left', () async {
+    final realtime = _DeferredConnectionRealtimeService();
+    final notifier = PresenceNotifier(realtime);
+
+    await notifier.joinRoom(
+      roomCode: 'abc234',
+      userId: 'alice',
+      nickname: 'Alice',
+      avatarColorIndex: 1,
+    );
+    await notifier.announceJoining();
+    await notifier.leaveRoom();
+
+    realtime.emitConnected();
+    await Future<void>.delayed(Duration.zero);
+
+    expect(realtime.broadcasts, isEmpty);
+
+    notifier.dispose();
+    await realtime.disposeFake();
+    await realtime.close();
   });
 }
 
@@ -204,6 +228,12 @@ class _DeferredConnectionRealtimeService extends RealtimeService {
     _connected = true;
     _connection.add(
       const RealtimeConnectionEvent(RealtimeConnectionStatus.connected),
+    );
+  }
+
+  void emitReconnecting() {
+    _connection.add(
+      const RealtimeConnectionEvent(RealtimeConnectionStatus.reconnecting),
     );
   }
 
