@@ -268,6 +268,36 @@ void main() {
       expect(notifier.state.members, hasLength(2));
     });
 
+    test('a failing newer roster read keeps an older success', () async {
+      final service = FakeRoomService()..members = [testMember(roomId: 'room-a')];
+      final notifier = RoomNotifier(service);
+      addTearDown(notifier.dispose);
+
+      await notifier.createRoom('Alice');
+
+      // Presence and membership_changed both refresh for the same join.
+      final firstRead = Completer<List<RoomMember>>();
+      service.memberRead = firstRead;
+      final first = notifier.refreshMembers();
+      await Future<void>.delayed(Duration.zero);
+
+      final secondRead = Completer<List<RoomMember>>();
+      service.memberRead = secondRead;
+      final second = notifier.refreshMembers();
+      await Future<void>.delayed(Duration.zero);
+
+      firstRead.complete([
+        testMember(roomId: 'room-a'),
+        testMember(roomId: 'room-a', id: 'member-b', userId: 'user-b', nickname: 'Bob'),
+      ]);
+      secondRead.completeError(StateError('network failure'));
+      await first;
+      await second;
+
+      // Losing the only usable answer would leave Start Reading disabled.
+      expect(notifier.state.members, hasLength(2));
+    });
+
     test('losing the room channel marks every member offline', () async {
       final service = FakeRoomService()..members = [testMember(roomId: 'room-a')];
       final notifier = RoomNotifier(service);

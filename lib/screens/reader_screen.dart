@@ -41,6 +41,7 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
   bool _recoveringAuthoritativePosition = false;
   bool _pendingAuthoritativeCfiSync = false;
   bool _authoritativeCfiSyncInFlight = false;
+  Timer? _authoritativeRetryTimer;
   int _positionRecoveryGeneration = 0;
   Future<void> _cfiWriteChain = Future<void>.value();
 
@@ -120,6 +121,8 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
   void dispose() {
     _isStoppingPageSync = true;
     ++_positionRecoveryGeneration;
+    _authoritativeRetryTimer?.cancel();
+    _authoritativeRetryTimer = null;
     final pageSync = ref.read(pageSyncProvider.notifier);
     pageSync.updateReaderContext(isReady: false, currentCfi: _currentCfi);
     unawaited(() async {
@@ -266,7 +269,20 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
       return;
     }
 
-    final targetCfi = authoritativeCfi ?? fallbackCfi;
+    if (authoritativeCfi == null) {
+      // The write may well have committed before the response was lost, so
+      // fallbackCfi is the pre-turn page and might already be wrong. Release
+      // the overlay — the reader must not stay frozen, and they need to be
+      // able to leave — but stay out of the quorum: a turn taken from an
+      // unconfirmed position revision-retries over whatever the database
+      // actually holds. Keep asking until a snapshot answers.
+      setState(() => _recoveringAuthoritativePosition = false);
+      _pendingAuthoritativeCfiSync = true;
+      _scheduleAuthoritativePositionRetry();
+      return;
+    }
+
+    final targetCfi = authoritativeCfi;
     ref.read(bookProvider.notifier).updateCfi(targetCfi);
     setState(() => _recoveringAuthoritativePosition = false);
     if (_currentCfi != targetCfi) {
@@ -274,17 +290,33 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
       return;
     }
 
+    _restoreReaderReadiness(targetCfi);
+  }
+
+  /// Re-enters the page-turn quorum once this reader's position is confirmed.
+  void _restoreReaderReadiness(String confirmedCfi) {
     ref
         .read(pageSyncProvider.notifier)
-        .updateReaderContext(isReady: _isReaderReady, currentCfi: targetCfi);
-    try {
-      await ref
+        .updateReaderContext(isReady: _isReaderReady, currentCfi: confirmedCfi);
+    unawaited(
+      ref
           .read(presenceProvider.notifier)
-          .updateReaderReady(_isReaderReady);
-    } catch (_) {
-      // The cached Presence intent remains authoritative locally and will be
-      // retried by the connection lifecycle after transport recovery.
-    }
+          .updateReaderReady(_isReaderReady)
+          .catchError((Object _) {
+            // The cached Presence intent remains authoritative locally and is
+            // retried by the connection lifecycle after transport recovery.
+          }),
+    );
+  }
+
+  void _scheduleAuthoritativePositionRetry() {
+    _authoritativeRetryTimer?.cancel();
+    _authoritativeRetryTimer = Timer(const Duration(seconds: 5), () {
+      if (!mounted || _isStoppingPageSync || !_pendingAuthoritativeCfiSync) {
+        return;
+      }
+      unawaited(_syncAuthoritativePosition());
+    });
   }
 
   void _displayCommittedPosition(String targetCfi) {
@@ -333,11 +365,19 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
       if (!mounted || _isStoppingPageSync) return;
       if (room == null) {
         _pendingAuthoritativeCfiSync = true;
+        _scheduleAuthoritativePositionRetry();
         return;
       }
+      _pendingAuthoritativeCfiSync = false;
       final freshCfi = room.currentCfi;
-      if (freshCfi == null || freshCfi == _currentCfi) return;
-      _adoptAuthoritativeCfi(freshCfi);
+      if (freshCfi != null && freshCfi != _currentCfi) {
+        // The rebuild reloads the viewer, which restores readiness through
+        // onChaptersLoaded once the new position is actually displayed.
+        _adoptAuthoritativeCfi(freshCfi);
+        return;
+      }
+      // Confirmed to be on the page already displayed: safe to rejoin quorum.
+      _restoreReaderReadiness(_currentCfi ?? room.currentCfi ?? '');
     } finally {
       _authoritativeCfiSyncInFlight = false;
     }

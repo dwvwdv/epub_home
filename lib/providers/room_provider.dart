@@ -80,6 +80,7 @@ class RoomNotifier extends StateNotifier<RoomState> {
   bool _revocationInProgress = false;
   int _roomSessionGeneration = 0;
   int _membersFetchGeneration = 0;
+  int _appliedMembersGeneration = 0;
   List<Map<String, dynamic>> _lastPresenceUsers = const [];
 
   RoomNotifier(
@@ -162,25 +163,32 @@ class RoomNotifier extends StateNotifier<RoomState> {
     if (room == null) return;
     final roomSessionGeneration = _roomSessionGeneration;
     // The database owns the roster; Presence only owns the per-member online
-    // and has_book overlay. Guarding on a fetch generation discards a fetch
-    // that a *newer* fetch has already superseded, while a Presence overlay
-    // applied during the await no longer throws the roster away — that used to
-    // drop a member who joined while this refresh was in flight, because the
-    // same listener re-applies Presence on every event.
+    // and has_book overlay. A Presence overlay applied during the await no
+    // longer throws the roster away — that used to drop a member who joined
+    // while this refresh was in flight, because the same listener re-applies
+    // Presence on every event.
+    //
+    // Results are ordered against the last one *applied*, not the last one
+    // started: a fetch only loses to a newer fetch that actually succeeded.
+    // Two listeners now race for the same join (Presence and
+    // membership_changed), so discarding an older success merely because a
+    // later request had started would lose the roster entirely whenever that
+    // later request failed.
     final fetchGeneration = ++_membersFetchGeneration;
     if (presenceUsers != null) _lastPresenceUsers = presenceUsers;
     try {
       final members = await _roomService.getRoomMembers(room.id);
       if (!_isCurrentRoomSession(room.id, roomSessionGeneration) ||
-          fetchGeneration != _membersFetchGeneration) {
+          fetchGeneration <= _appliedMembersGeneration) {
         return;
       }
+      _appliedMembersGeneration = fetchGeneration;
       state = state.copyWith(
         members: _applyPresenceOverlay(members, _lastPresenceUsers),
       );
     } catch (error) {
       if (_isCurrentRoomSession(room.id, roomSessionGeneration) &&
-          fetchGeneration == _membersFetchGeneration) {
+          fetchGeneration > _appliedMembersGeneration) {
         state = state.copyWith(error: error.toString());
       }
     }
@@ -553,6 +561,7 @@ class RoomNotifier extends StateNotifier<RoomState> {
   /// a previous room cannot bleed into the next one.
   void _resetMemberTracking() {
     _membersFetchGeneration++;
+    _appliedMembersGeneration = _membersFetchGeneration;
     _lastPresenceUsers = const [];
   }
 
