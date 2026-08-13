@@ -162,6 +162,21 @@
   2. 或者把相等性判斷從「字串相等」放寬成「spine index 相同」，只用 CFI 字串做顯示。
 - **注意**：這會動到 consensus 的核心判斷，必須先補測試再改。
 
+### [ ] #H reader_screen.dart 沒有任何測試
+
+- **檔案**：`lib/screens/reader_screen.dart`
+- **問題**：這個檔案是整個 App 狀態最多的地方（`_isReaderReady`、`_displayingTargetCfi`、
+  `_pendingAuthoritativeCfiSync`、`_recoveringAuthoritativePosition`、`_isStoppingPageSync`
+  互相牽動），但完全沒有測試。這次 PR 的 code review 找出 10 個問題，其中 7 個在這個檔案，
+  而且全都是同一種形狀：「某個地方發布 readiness 時漏掉了一個條件」。
+- **已做的緩解**：readiness 改成由 `_isReadyForTurns` 單一推導、
+  透過 `_publishReadiness()` 單一發布，呼叫端只改 state 不再自己算值——
+  讓「漏掉條件」這類 bug 在結構上不可能發生。
+  （進入 / 離開 reader 的 lifecycle 路徑仍保留顯式的 await 順序，那是刻意的。）
+- **還缺的**：`EpubViewer` 需要真的 WebView 才能跑，所以要測這個畫面得先把
+  viewer 抽成介面（像 `PageSyncTransport` 那樣注入），才能在測試裡驅動
+  `onChaptersLoaded` / `onRelocated`。在那之前，這個檔案的改動只能靠實機驗證。
+
 ### [ ] #G 同一使用者多個 reader session 的 readiness 是 OR 合併的
 
 - **檔案**：`lib/services/presence_merge.dart`

@@ -110,11 +110,10 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
     if (freshCfi != null && freshCfi != _currentCfi && mounted) {
       _adoptAuthoritativeCfi(freshCfi);
     }
-    pageSync.updateReaderContext(
-      isReady: _isReaderReady,
-      currentCfi: _currentCfi,
-    );
-    await presence.updateReaderReady(_isReaderReady);
+    // Deriving readiness here is what keeps a deferred authoritative sync from
+    // being undone: _adoptAuthoritativeCfi may have just marked this reader
+    // unready, and this used to overwrite that with a bare _isReaderReady.
+    _publishReadiness();
   }
 
   @override
@@ -200,12 +199,7 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
       if (roomId != null) {
         final recoveryGeneration = ++_positionRecoveryGeneration;
         setState(() => _recoveringAuthoritativePosition = true);
-        ref
-            .read(pageSyncProvider.notifier)
-            .updateReaderContext(isReady: false, currentCfi: _currentCfi);
-        unawaited(
-          ref.read(presenceProvider.notifier).updateReaderReady(false),
-        );
+        _publishReadiness();
         unawaited(
           _recoverAuthoritativePosition(
             fallbackCfi: targetCfi,
@@ -290,7 +284,7 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
       return;
     }
 
-    _restoreReaderReadiness(targetCfi);
+    _publishReadiness(currentCfi: targetCfi);
   }
 
   /// True only when this reader's position is known to match the room's.
@@ -301,49 +295,48 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
   bool get _canAdvertiseReady =>
       !_pendingAuthoritativeCfiSync && !_recoveringAuthoritativePosition;
 
-  /// The single gate for "this reader may take part in a page turn".
+  /// Whether this reader may take part in a page turn right now.
   ///
-  /// It drives the local controls *and* what the rest of the room is told.
-  /// Gating only the controls is not enough: the others keep this reader in
-  /// their quorum, start a turn at the authoritative CFI, and this client
-  /// rejects it because it still holds the old one — cancelling a valid turn.
-  void _setPendingAuthoritativeSync(bool isPending) {
-    if (_pendingAuthoritativeCfiSync == isPending) return;
-    _pendingAuthoritativeCfiSync = isPending;
-    if (mounted) setState(() {});
-    if (isPending) {
-      ref
-          .read(pageSyncProvider.notifier)
-          .updateReaderContext(isReady: false, currentCfi: _currentCfi);
-      unawaited(
-        ref
-            .read(presenceProvider.notifier)
-            .updateReaderReady(false)
-            .catchError((Object _) {
-              // Presence intent stays cached locally and is retried by the
-              // connection lifecycle after transport recovery.
-            }),
-      );
-      return;
-    }
-    _restoreReaderReadiness(_currentCfi ?? '');
-  }
+  /// Derived from state in one place rather than decided at each call site.
+  /// Readiness used to be pushed imperatively from nine different places, and
+  /// every one of them had to remember the full set of conditions; each bug
+  /// found here was another site that had forgotten one. Call sites now change
+  /// state and call [_publishReadiness] — they never compute the value.
+  bool get _isReadyForTurns =>
+      _isReaderReady &&
+      !_isStoppingPageSync &&
+      _displayingTargetCfi == null &&
+      _canAdvertiseReady;
 
-  /// Re-enters the page-turn quorum once this reader's position is confirmed.
-  void _restoreReaderReadiness(String confirmedCfi) {
-    final isReadyNow = _isReaderReady && _canAdvertiseReady;
+  /// Tells the sync service and the rest of the room what this reader can do.
+  ///
+  /// Both must agree: the service decides which requests this client accepts,
+  /// Presence decides whether the others put it in their quorum. Publishing
+  /// only one of them is what lets a client reject the turns it authorized.
+  void _publishReadiness({String? currentCfi}) {
+    final isReady = _isReadyForTurns;
     ref
         .read(pageSyncProvider.notifier)
-        .updateReaderContext(isReady: isReadyNow, currentCfi: confirmedCfi);
+        .updateReaderContext(
+          isReady: isReady,
+          currentCfi: currentCfi ?? _currentCfi,
+        );
     unawaited(
       ref
           .read(presenceProvider.notifier)
-          .updateReaderReady(isReadyNow)
+          .updateReaderReady(isReady)
           .catchError((Object _) {
             // The cached Presence intent remains authoritative locally and is
             // retried by the connection lifecycle after transport recovery.
           }),
     );
+  }
+
+  void _setPendingAuthoritativeSync(bool isPending) {
+    if (_pendingAuthoritativeCfiSync == isPending) return;
+    _pendingAuthoritativeCfiSync = isPending;
+    if (mounted) setState(() {});
+    _publishReadiness();
   }
 
   void _scheduleAuthoritativePositionRetry() {
@@ -365,8 +358,7 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
       return;
     }
     _displayingTargetCfi = targetCfi;
-    ref.read(pageSyncProvider.notifier).updateReaderContext(isReady: false);
-    unawaited(ref.read(presenceProvider.notifier).updateReaderReady(false));
+    _publishReadiness();
     _epubController?.display(cfi: targetCfi);
   }
 
@@ -378,12 +370,14 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
   /// turn would write a position derived from the stale one over the newer
   /// database value. The retry is therefore deferred until the request that
   /// blocked the rebuild settles.
-  void _adoptAuthoritativeCfi(String freshCfi) {
+  /// Returns whether the viewer actually started rebuilding.
+  bool _adoptAuthoritativeCfi(String freshCfi) {
     final previousCfi = _currentCfi;
     _currentCfi = freshCfi;
-    if (_rebuildViewer()) return;
+    if (_rebuildViewer()) return true;
     _currentCfi = previousCfi;
     _setPendingAuthoritativeSync(true);
+    return false;
   }
 
   Future<void> _syncAuthoritativePosition() async {
@@ -405,13 +399,18 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
         _scheduleAuthoritativePositionRetry();
         return;
       }
-      // Clearing the gate is what rejoins the quorum, either directly when the
-      // page is already correct, or through onChaptersLoaded after the rebuild
-      // below. A refused rebuild sets the gate straight back.
-      _setPendingAuthoritativeSync(false);
       final freshCfi = room.currentCfi;
-      if (freshCfi != null && freshCfi != _currentCfi) {
-        _adoptAuthoritativeCfi(freshCfi);
+      if (freshCfi == null || freshCfi == _currentCfi) {
+        // Confirmed on the page already displayed: rejoin the quorum now.
+        _setPendingAuthoritativeSync(false);
+        return;
+      }
+      // Rebuild first, then open the gate. Clearing it first would publish
+      // readiness for the *old* viewer, and Presence updates are serialized —
+      // peers could start a turn on that before the rebuild's not-ready
+      // arrives. onChaptersLoaded reopens it once the new page is displayed.
+      if (_adoptAuthoritativeCfi(freshCfi)) {
+        _setPendingAuthoritativeSync(false);
       }
     } finally {
       _authoritativeCfiSyncInFlight = false;
@@ -425,10 +424,7 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
       return false;
     }
     _isReaderReady = false;
-    ref
-        .read(pageSyncProvider.notifier)
-        .updateReaderContext(isReady: false, currentCfi: _currentCfi);
-    unawaited(ref.read(presenceProvider.notifier).updateReaderReady(false));
+    _publishReadiness();
     setState(() => _viewerKey++);
     return true;
   }
@@ -585,22 +581,11 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
                         onChaptersLoaded: (chapters) {
                           if (!mounted || _isStoppingPageSync) return;
                           setState(() => _isReaderReady = true);
-                          // A viewer reload does not confirm the position. If
-                          // recovery is still pending, loading a new viewer —
-                          // a theme change, say — must not quietly put this
-                          // client back in the quorum on an unverified page.
-                          final isReadyNow = _canAdvertiseReady;
-                          ref
-                              .read(pageSyncProvider.notifier)
-                              .updateReaderContext(
-                                isReady: isReadyNow,
-                                currentCfi: _currentCfi,
-                              );
-                          unawaited(
-                            ref
-                                .read(presenceProvider.notifier)
-                                .updateReaderReady(isReadyNow),
-                          );
+                          // A viewer reload does not confirm the position, so
+                          // loading a new viewer — a theme change, say — must
+                          // not put this client back in the quorum while a
+                          // recovery is still pending. _publishReadiness knows.
+                          _publishReadiness();
 
                           final targetCfi = _queuedTargetCfi;
                           if (targetCfi != null) {
@@ -622,26 +607,7 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
                           ref
                               .read(bookProvider.notifier)
                               .updateCfi(relocatedCfi);
-                          // Presence readiness must match the local reader
-                          // context exactly. Advertising reader_ready=true
-                          // while the viewer has not finished loading puts
-                          // this client in everyone else's quorum, and it then
-                          // rejects the very requests that quorum authorized.
-                          final isReadyNow =
-                              _isReaderReady &&
-                              _displayingTargetCfi == null &&
-                              _canAdvertiseReady;
-                          ref
-                              .read(pageSyncProvider.notifier)
-                              .updateReaderContext(
-                                isReady: isReadyNow,
-                                currentCfi: relocatedCfi,
-                              );
-                          unawaited(
-                            ref
-                                .read(presenceProvider.notifier)
-                                .updateReaderReady(isReadyNow),
-                          );
+                          _publishReadiness(currentCfi: relocatedCfi);
 
                           if (committedTarget != null) {
                             unawaited(
