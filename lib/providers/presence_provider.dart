@@ -72,8 +72,15 @@ class PresenceNotifier extends StateNotifier<PresenceState> {
   bool _currentReaderReady = false;
   bool _isAppActive = true;
   bool _hasPendingJoinAnnouncement = false;
+  Timer? _joinAnnouncementRetryTimer;
 
-  PresenceNotifier(this._realtimeService) : super(const PresenceState()) {
+  /// Gap between retries of a queued join announcement whose send failed.
+  final Duration joinAnnouncementRetryDelay;
+
+  PresenceNotifier(
+    this._realtimeService, {
+    this.joinAnnouncementRetryDelay = const Duration(seconds: 3),
+  }) : super(const PresenceState()) {
     _presenceSubscription = _realtimeService.presenceStream.listen((event) {
       // Already merged to one row per logical user by RealtimeService.
       final users = _realtimeService.getOnlineUsers();
@@ -208,13 +215,20 @@ class PresenceNotifier extends StateNotifier<PresenceState> {
   }
 
   Future<void> _flushJoinAnnouncement() async {
+    _joinAnnouncementRetryTimer?.cancel();
+    _joinAnnouncementRetryTimer = null;
     if (!_hasPendingJoinAnnouncement || !_realtimeService.isConnected) return;
     _hasPendingJoinAnnouncement = false;
     try {
       await _announceMembership('joined');
     } catch (_) {
-      // Re-queue for the next connected event rather than losing the join.
+      // A send can fail while the channel stays 'connected', so waiting for
+      // another connection event would strand the join indefinitely.
       _hasPendingJoinAnnouncement = true;
+      _joinAnnouncementRetryTimer = Timer(joinAnnouncementRetryDelay, () {
+        _joinAnnouncementRetryTimer = null;
+        unawaited(_flushJoinAnnouncement());
+      });
     }
   }
 
@@ -256,6 +270,8 @@ class PresenceNotifier extends StateNotifier<PresenceState> {
   void _clearCurrentUser() {
     // A queued announcement belongs to the room session that queued it.
     _hasPendingJoinAnnouncement = false;
+    _joinAnnouncementRetryTimer?.cancel();
+    _joinAnnouncementRetryTimer = null;
     _currentRoomCode = null;
     _currentRoomTopicId = null;
     _currentUserId = null;
@@ -275,6 +291,8 @@ class PresenceNotifier extends StateNotifier<PresenceState> {
 
   @override
   void dispose() {
+    _joinAnnouncementRetryTimer?.cancel();
+    _joinAnnouncementRetryTimer = null;
     _presenceSubscription?.cancel();
     _connectionSubscription?.cancel();
     super.dispose();

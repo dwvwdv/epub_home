@@ -154,6 +154,36 @@ void main() {
     await realtime.close();
   });
 
+  test('a failed join announcement retries while still connected', () async {
+    final realtime = _DeferredConnectionRealtimeService()..failNextBroadcast = true;
+    final notifier = PresenceNotifier(
+      realtime,
+      joinAnnouncementRetryDelay: const Duration(milliseconds: 10),
+    );
+
+    await notifier.joinRoom(
+      roomCode: 'abc234',
+      userId: 'alice',
+      nickname: 'Alice',
+      avatarColorIndex: 1,
+    );
+    await notifier.announceJoining();
+
+    realtime.emitConnected();
+    await Future<void>.delayed(Duration.zero);
+    expect(realtime.broadcasts, isEmpty);
+
+    // The channel never left 'connected', so no further connection event will
+    // arrive to carry the retry.
+    await Future<void>.delayed(const Duration(milliseconds: 40));
+
+    expect(realtime.broadcasts.single.payload['action'], 'joined');
+
+    notifier.dispose();
+    await realtime.disposeFake();
+    await realtime.close();
+  });
+
   test('a queued join announcement is dropped when the room is left', () async {
     final realtime = _DeferredConnectionRealtimeService();
     final notifier = PresenceNotifier(realtime);
@@ -190,6 +220,7 @@ class _RecordedBroadcast {
 class _DeferredConnectionRealtimeService extends RealtimeService {
   final _connection = StreamController<RealtimeConnectionEvent>.broadcast();
   final broadcasts = <_RecordedBroadcast>[];
+  bool failNextBroadcast = false;
   bool _connected = false;
 
   _DeferredConnectionRealtimeService()
@@ -219,6 +250,10 @@ class _DeferredConnectionRealtimeService extends RealtimeService {
     required String event,
     required Map<String, dynamic> payload,
   }) async {
+    if (failNextBroadcast) {
+      failNextBroadcast = false;
+      throw StateError('transient send failure');
+    }
     broadcasts.add(
       _RecordedBroadcast(event, Map<String, dynamic>.from(payload)),
     );
