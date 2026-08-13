@@ -197,11 +197,15 @@ class _RoomLobbyScreenState extends ConsumerState<RoomLobbyScreen> {
       // Presence tells the others a connection appeared; it does not tell them
       // the database roster grew. Without this the members already in the
       // lobby keep showing the roster from before this member joined.
-      try {
-        await ref.read(presenceProvider.notifier).announceJoining();
-      } catch (error) {
-        debugPrint('Unable to announce room arrival: $error');
-      }
+      // Not awaited: the announcement waits for the channel to subscribe, and
+      // the lobby must not sit on a spinner for that.
+      unawaited(
+        ref.read(presenceProvider.notifier).announceJoining().catchError((
+          Object error,
+        ) {
+          debugPrint('Unable to announce room arrival: $error');
+        }),
+      );
 
       if (mounted) setState(() => _isInitializing = false);
     } catch (error) {

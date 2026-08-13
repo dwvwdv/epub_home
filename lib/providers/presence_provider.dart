@@ -57,6 +57,9 @@ class PresenceState {
 }
 
 class PresenceNotifier extends StateNotifier<PresenceState> {
+  /// How long a join announcement waits for the channel to subscribe.
+  static const announceJoinTimeout = Duration(seconds: 10);
+
   final RealtimeService _realtimeService;
   StreamSubscription<Map<String, dynamic>>? _presenceSubscription;
   StreamSubscription<RealtimeConnectionEvent>? _connectionSubscription;
@@ -187,8 +190,32 @@ class PresenceNotifier extends StateNotifier<PresenceState> {
   /// grew: it only says a connection appeared. Announcing the join makes every
   /// other client re-read the authoritative member list instead of waiting for
   /// an unrelated refresh.
+  ///
+  /// [RealtimeService.joinRoom] returns once `subscribe()` has been *called*,
+  /// not once the channel is subscribed, so the transport is still connecting
+  /// here. Waiting for the connection is what makes this announcement happen
+  /// at all — sending immediately silently dropped every join.
   Future<void> announceJoining() async {
+    if (!await _waitForConnection(announceJoinTimeout)) return;
     await _announceMembership('joined');
+  }
+
+  Future<bool> _waitForConnection(Duration timeout) async {
+    if (_realtimeService.isConnected) return true;
+    // firstWhere subscribes synchronously, so re-checking after it is set up
+    // closes the window where the connection lands between the two checks.
+    final connected = _realtimeService.connectionStream
+        .firstWhere(
+          (event) => event.status == RealtimeConnectionStatus.connected,
+        )
+        .then<bool>((_) => true)
+        .catchError((Object _) => false);
+    if (_realtimeService.isConnected) return true;
+    try {
+      return await connected.timeout(timeout);
+    } on TimeoutException {
+      return _realtimeService.isConnected;
+    }
   }
 
   Future<void> _announceMembership(String action) async {
