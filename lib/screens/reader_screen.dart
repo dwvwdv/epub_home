@@ -301,11 +301,32 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
   bool get _canAdvertiseReady =>
       !_pendingAuthoritativeCfiSync && !_recoveringAuthoritativePosition;
 
-  /// Rebuilds so the controls gated on [_canAdvertiseReady] follow the flag.
+  /// The single gate for "this reader may take part in a page turn".
+  ///
+  /// It drives the local controls *and* what the rest of the room is told.
+  /// Gating only the controls is not enough: the others keep this reader in
+  /// their quorum, start a turn at the authoritative CFI, and this client
+  /// rejects it because it still holds the old one — cancelling a valid turn.
   void _setPendingAuthoritativeSync(bool isPending) {
     if (_pendingAuthoritativeCfiSync == isPending) return;
     _pendingAuthoritativeCfiSync = isPending;
     if (mounted) setState(() {});
+    if (isPending) {
+      ref
+          .read(pageSyncProvider.notifier)
+          .updateReaderContext(isReady: false, currentCfi: _currentCfi);
+      unawaited(
+        ref
+            .read(presenceProvider.notifier)
+            .updateReaderReady(false)
+            .catchError((Object _) {
+              // Presence intent stays cached locally and is retried by the
+              // connection lifecycle after transport recovery.
+            }),
+      );
+      return;
+    }
+    _restoreReaderReadiness(_currentCfi ?? '');
   }
 
   /// Re-enters the page-turn quorum once this reader's position is confirmed.
@@ -384,16 +405,14 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
         _scheduleAuthoritativePositionRetry();
         return;
       }
+      // Clearing the gate is what rejoins the quorum, either directly when the
+      // page is already correct, or through onChaptersLoaded after the rebuild
+      // below. A refused rebuild sets the gate straight back.
       _setPendingAuthoritativeSync(false);
       final freshCfi = room.currentCfi;
       if (freshCfi != null && freshCfi != _currentCfi) {
-        // The rebuild reloads the viewer, which restores readiness through
-        // onChaptersLoaded once the new position is actually displayed.
         _adoptAuthoritativeCfi(freshCfi);
-        return;
       }
-      // Confirmed to be on the page already displayed: safe to rejoin quorum.
-      _restoreReaderReadiness(_currentCfi ?? room.currentCfi ?? '');
     } finally {
       _authoritativeCfiSyncInFlight = false;
     }
