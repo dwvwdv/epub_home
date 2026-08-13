@@ -199,7 +199,10 @@ class RoomNotifier extends StateNotifier<RoomState> {
     List<RoomMember> members,
     List<Map<String, dynamic>> onlineUsers,
   ) {
-    if (onlineUsers.isEmpty) return members;
+    // An empty list is a real answer, not a missing one: the channel dropped
+    // and nobody is online. Skipping it would leave every cached member showing
+    // as online while the lobby header reports zero, and the roster refresh
+    // that would correct it needs the same network that just failed.
     final onlineById = {
       for (final user in onlineUsers)
         if (user['user_id'] is String) user['user_id'] as String: user,

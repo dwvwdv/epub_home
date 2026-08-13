@@ -268,6 +268,26 @@ void main() {
       expect(notifier.state.members, hasLength(2));
     });
 
+    test('losing the room channel marks every member offline', () async {
+      final service = FakeRoomService()..members = [testMember(roomId: 'room-a')];
+      final notifier = RoomNotifier(service);
+      addTearDown(notifier.dispose);
+
+      await notifier.createRoom('Alice');
+      notifier.updateMembersFromPresence([
+        {'user_id': 'user-a', 'has_book': true},
+      ]);
+      expect(notifier.state.members.single.isOnline, isTrue);
+
+      // PresenceNotifier clears onlineUsers on disconnect; an empty overlay is
+      // an answer, not a gap, and the roster refresh that would otherwise fix
+      // this needs the network that just went away.
+      notifier.updateMembersFromPresence(const []);
+
+      expect(notifier.state.members.single.isOnline, isFalse);
+      expect(notifier.state.members.single.hasBook, isTrue);
+    });
+
     test('presence with no roster change does not churn state', () async {
       final service = FakeRoomService()..members = [testMember(roomId: 'room-a')];
       final notifier = RoomNotifier(service);
