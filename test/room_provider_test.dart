@@ -209,6 +209,132 @@ void main() {
       expect(notifier.state.members.single.isOnline, isTrue);
     });
 
+    test('a member who joins mid-refresh survives a presence overlay', () async {
+      final service = FakeRoomService()..members = [testMember(roomId: 'room-a')];
+      final notifier = RoomNotifier(service);
+      addTearDown(notifier.dispose);
+
+      await notifier.createRoom('Alice');
+      final delayedMembers = Completer<List<RoomMember>>();
+      service.memberRead = delayedMembers;
+      final refresh = notifier.refreshMembers(
+        presenceUsers: [
+          {'user_id': 'user-a'},
+          {'user_id': 'user-b'},
+        ],
+      );
+      await Future<void>.delayed(Duration.zero);
+
+      // Presence keeps firing while the roster read is in flight; the same
+      // lobby listener re-applies it on every event.
+      notifier.updateMembersFromPresence([
+        {'user_id': 'user-a', 'has_book': true},
+        {'user_id': 'user-b'},
+      ]);
+      delayedMembers.complete([
+        testMember(roomId: 'room-a'),
+        testMember(roomId: 'room-a', id: 'member-b', userId: 'user-b', nickname: 'Bob'),
+      ]);
+      await refresh;
+
+      expect(
+        notifier.state.members.map((member) => member.userId),
+        ['user-a', 'user-b'],
+      );
+      expect(notifier.state.members.every((member) => member.isOnline), isTrue);
+      expect(notifier.state.members.first.hasBook, isTrue);
+    });
+
+    test('a superseded roster read is discarded by the newer one', () async {
+      final service = FakeRoomService()..members = [testMember(roomId: 'room-a')];
+      final notifier = RoomNotifier(service);
+      addTearDown(notifier.dispose);
+
+      await notifier.createRoom('Alice');
+      final stale = Completer<List<RoomMember>>();
+      service.memberRead = stale;
+      final staleRefresh = notifier.refreshMembers();
+      await Future<void>.delayed(Duration.zero);
+
+      service.memberRead = null;
+      service.members = [
+        testMember(roomId: 'room-a'),
+        testMember(roomId: 'room-a', id: 'member-b', userId: 'user-b', nickname: 'Bob'),
+      ];
+      await notifier.refreshMembers();
+      stale.complete([testMember(roomId: 'room-a')]);
+      await staleRefresh;
+
+      expect(notifier.state.members, hasLength(2));
+    });
+
+    test('a failing newer roster read keeps an older success', () async {
+      final service = FakeRoomService()..members = [testMember(roomId: 'room-a')];
+      final notifier = RoomNotifier(service);
+      addTearDown(notifier.dispose);
+
+      await notifier.createRoom('Alice');
+
+      // Presence and membership_changed both refresh for the same join.
+      final firstRead = Completer<List<RoomMember>>();
+      service.memberRead = firstRead;
+      final first = notifier.refreshMembers();
+      await Future<void>.delayed(Duration.zero);
+
+      final secondRead = Completer<List<RoomMember>>();
+      service.memberRead = secondRead;
+      final second = notifier.refreshMembers();
+      await Future<void>.delayed(Duration.zero);
+
+      firstRead.complete([
+        testMember(roomId: 'room-a'),
+        testMember(roomId: 'room-a', id: 'member-b', userId: 'user-b', nickname: 'Bob'),
+      ]);
+      secondRead.completeError(StateError('network failure'));
+      await first;
+      await second;
+
+      // Losing the only usable answer would leave Start Reading disabled.
+      expect(notifier.state.members, hasLength(2));
+    });
+
+    test('losing the room channel marks every member offline', () async {
+      final service = FakeRoomService()..members = [testMember(roomId: 'room-a')];
+      final notifier = RoomNotifier(service);
+      addTearDown(notifier.dispose);
+
+      await notifier.createRoom('Alice');
+      notifier.updateMembersFromPresence([
+        {'user_id': 'user-a', 'has_book': true},
+      ]);
+      expect(notifier.state.members.single.isOnline, isTrue);
+
+      // PresenceNotifier clears onlineUsers on disconnect; an empty overlay is
+      // an answer, not a gap, and the roster refresh that would otherwise fix
+      // this needs the network that just went away.
+      notifier.updateMembersFromPresence(const []);
+
+      expect(notifier.state.members.single.isOnline, isFalse);
+      expect(notifier.state.members.single.hasBook, isTrue);
+    });
+
+    test('presence with no roster change does not churn state', () async {
+      final service = FakeRoomService()..members = [testMember(roomId: 'room-a')];
+      final notifier = RoomNotifier(service);
+      addTearDown(notifier.dispose);
+
+      await notifier.createRoom('Alice');
+      notifier.updateMembersFromPresence([
+        {'user_id': 'user-a'},
+      ]);
+      final settled = notifier.state.members;
+      notifier.updateMembersFromPresence([
+        {'user_id': 'user-a'},
+      ]);
+
+      expect(identical(notifier.state.members, settled), isTrue);
+    });
+
     test('a delayed room refresh cannot resurrect a previous session', () async {
       final service = FakeRoomService();
       final notifier = RoomNotifier(service);
@@ -350,12 +476,17 @@ Room testRoom({
   );
 }
 
-RoomMember testMember({required String roomId}) {
+RoomMember testMember({
+  required String roomId,
+  String id = 'member-a',
+  String userId = 'user-a',
+  String nickname = 'Alice',
+}) {
   return RoomMember(
-    id: 'member-a',
+    id: id,
     roomId: roomId,
-    userId: 'user-a',
-    nickname: 'Alice',
+    userId: userId,
+    nickname: nickname,
     joinedAt: DateTime.utc(2026, 8, 12),
   );
 }

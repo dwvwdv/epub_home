@@ -118,9 +118,16 @@ class _RoomLobbyScreenState extends ConsumerState<RoomLobbyScreen> {
 
       _membershipChangedSub = realtimeService
           .broadcastStream('membership_changed')
-          .listen((_) {
+          .listen((payload) {
             if (!mounted) return;
-            unawaited(_refreshMembersAfterLeaveSignal());
+            if (payload['user_id'] == userId) return;
+            unawaited(
+              _refreshMembersAfterMembershipSignal(
+                // A join is already committed when it is announced; only a
+                // leave races its own broadcast against the leave RPC.
+                waitForCommit: payload['action'] != 'joined',
+              ),
+            );
           });
 
       // Feature 3: Listen for start_reading broadcast → navigate all members to reader.
@@ -187,6 +194,19 @@ class _RoomLobbyScreenState extends ConsumerState<RoomLobbyScreen> {
             readerReady: false,
           );
 
+      // Presence tells the others a connection appeared; it does not tell them
+      // the database roster grew. Without this the members already in the
+      // lobby keep showing the roster from before this member joined.
+      // Not awaited: the announcement waits for the channel to subscribe, and
+      // the lobby must not sit on a spinner for that.
+      unawaited(
+        ref.read(presenceProvider.notifier).announceJoining().catchError((
+          Object error,
+        ) {
+          debugPrint('Unable to announce room arrival: $error');
+        }),
+      );
+
       if (mounted) setState(() => _isInitializing = false);
     } catch (error) {
       if (mounted) {
@@ -230,11 +250,15 @@ class _RoomLobbyScreenState extends ConsumerState<RoomLobbyScreen> {
     _roomClosedSub = null;
   }
 
-  Future<void> _refreshMembersAfterLeaveSignal() async {
+  Future<void> _refreshMembersAfterMembershipSignal({
+    bool waitForCommit = true,
+  }) async {
     // The leaving client must broadcast before its membership is deleted so
     // Realtime RLS still authorizes the send. Give the following leave RPC a
     // short window to commit, then read the authoritative database state.
-    await Future<void>.delayed(const Duration(milliseconds: 200));
+    if (waitForCommit) {
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+    }
     if (!mounted) return;
     final roomNotifier = ref.read(roomProvider.notifier);
     await Future.wait<void>([

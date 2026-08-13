@@ -986,12 +986,17 @@ void main() {
         await flushEvents();
 
         expect(service.currentState.status, SyncStatus.idle);
-        expect(service.currentState.errorMessage, contains('not_ready'));
+        // The wire reason stays a protocol identifier; the reader sees prose.
+        expect(
+          service.currentState.errorMessage,
+          contains('a reader is not ready yet'),
+        );
         expect(
           transport.sentEvents.any(
             (event) =>
                 event.event == 'page_turn_cancel' &&
-                event.payload['request_id'] == requestId,
+                event.payload['request_id'] == requestId &&
+                event.payload['reason'] == 'required_reader_not_ready',
           ),
           isTrue,
         );
@@ -1021,6 +1026,136 @@ void main() {
         await transport.dispose();
       },
     );
+
+    test('a transient failure clears itself instead of pinning the bar', () async {
+      final transport = FakePageSyncTransport()
+        ..onlineUsers = [
+          readyUser('user-a'),
+          {'user_id': 'user-b', 'nickname': 'Bob', 'is_reading': false},
+        ];
+      final service = createService(
+        transport,
+        currentCfi: cfi,
+        errorAutoClearDelay: const Duration(milliseconds: 20),
+      );
+      addTearDown(() async {
+        await service.dispose();
+        await transport.dispose();
+      });
+
+      await service.requestPageTurn(
+        direction: PageTurnDirection.next,
+        fromCfi: cfi,
+      );
+      expect(service.currentState.errorMessage, isNotNull);
+
+      await Future<void>.delayed(const Duration(milliseconds: 60));
+
+      expect(service.currentState.errorMessage, isNull);
+      expect(service.currentState.status, SyncStatus.idle);
+    });
+
+    test('the quorum failure names the reader that is holding it up', () async {
+      final transport = FakePageSyncTransport()
+        ..onlineUsers = [
+          readyUser('user-a'),
+          {'user_id': 'user-b', 'nickname': 'Bob', 'is_reading': false},
+        ];
+      final service = createService(transport, currentCfi: cfi);
+      addTearDown(() async {
+        await service.dispose();
+        await transport.dispose();
+      });
+
+      await service.requestPageTurn(
+        direction: PageTurnDirection.next,
+        fromCfi: cfi,
+      );
+
+      expect(service.currentState.errorMessage, contains('Bob'));
+      expect(service.currentState.errorMessage, contains('become ready'));
+    });
+
+    test(
+      'a participant who never opened the reader stops blocking once offline',
+      () async {
+        final transport = FakePageSyncTransport()
+          ..onlineUsers = [
+            readyUser('user-a'),
+            // In the room, still in the lobby: never reported is_reading.
+            {'user_id': 'user-b', 'nickname': 'Bob', 'is_reading': false},
+          ];
+        final service = createService(transport, currentCfi: cfi);
+        addTearDown(() async {
+          await service.dispose();
+          await transport.dispose();
+        });
+
+        expect(
+          await service.requestPageTurn(
+            direction: PageTurnDirection.next,
+            fromCfi: cfi,
+          ),
+          isFalse,
+        );
+
+        // Bob closes the app: no presence meta at all any more.
+        transport.onlineUsers = [readyUser('user-a')];
+        transport.emitPresence({'event': 'leave'});
+        await flushEvents();
+
+        expect(
+          await service.requestPageTurn(
+            direction: PageTurnDirection.next,
+            fromCfi: cfi,
+          ),
+          isTrue,
+        );
+        expect(
+          service.currentState.currentRequest?.requiredUserIds,
+          {'user-a'},
+        );
+      },
+    );
+
+    test(
+      'a lobby participant blocks again after reconnecting to the room',
+      () async {
+        final transport = FakePageSyncTransport()
+          ..onlineUsers = [
+            readyUser('user-a'),
+            {'user_id': 'user-b', 'nickname': 'Bob', 'is_reading': false},
+          ];
+        final service = createService(transport, currentCfi: cfi);
+        addTearDown(() async {
+          await service.dispose();
+          await transport.dispose();
+        });
+
+        transport.onlineUsers = [readyUser('user-a')];
+        transport.emitPresence({'event': 'leave'});
+        await flushEvents();
+
+        // Back on the channel, still in the lobby. A blip must not exempt a
+        // participant that a continuously connected one would not be exempt
+        // from — absence is the only thing that drops them.
+        transport.onlineUsers = [
+          readyUser('user-a'),
+          {'user_id': 'user-b', 'nickname': 'Bob', 'is_reading': false},
+        ];
+        transport.emitPresence({'event': 'sync'});
+        await flushEvents();
+
+        expect(
+          await service.requestPageTurn(
+            direction: PageTurnDirection.next,
+            fromCfi: cfi,
+          ),
+          isFalse,
+        );
+        expect(service.currentState.errorMessage, contains('Bob'));
+      },
+    );
   });
 }
 
@@ -1030,6 +1165,7 @@ PageSyncService createService(
   String nickname = 'Alice',
   required String currentCfi,
   Duration requestTimeout = const Duration(seconds: 30),
+  Duration errorAutoClearDelay = const Duration(hours: 1),
 }) {
   final service = PageSyncService(
     transport: transport,
@@ -1041,6 +1177,7 @@ PageSyncService createService(
         .whereType<String>()
         .toSet(),
     requestTimeout: requestTimeout,
+    errorAutoClearDelay: errorAutoClearDelay,
   );
   service.updateReaderContext(isReady: true, currentCfi: currentCfi);
   service.initialize();

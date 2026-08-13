@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../config/app_constants.dart';
+import 'presence_merge.dart';
 import 'supabase_service.dart';
 
 enum RealtimeConnectionStatus {
@@ -242,7 +243,7 @@ class RealtimeService {
         if (!_isCurrent(channel, generation)) return;
         _presenceController.add({
           'event': 'sync',
-          'state': channel.presencePayloads(),
+          'state': mergePresenceUsers(channel.presencePayloads()),
           'generation': generation,
         });
       });
@@ -348,8 +349,16 @@ class RealtimeService {
     });
   }
 
+  /// One row per logical user.
+  ///
+  /// Presence is keyed per connection, so a user with a second device — or one
+  /// whose previous meta has not expired after a reconnect — appears more than
+  /// once in the raw payloads. Merging here keeps the page-turn quorum and the
+  /// lobby roster from disagreeing about who is online and ready.
   List<Map<String, dynamic>> getOnlineUsers() {
-    return _channel?.presencePayloads() ?? const [];
+    final channel = _channel;
+    if (channel == null) return const [];
+    return mergePresenceUsers(channel.presencePayloads());
   }
 
   Future<void> leaveRoom() {

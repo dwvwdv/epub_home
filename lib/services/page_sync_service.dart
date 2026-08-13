@@ -51,6 +51,13 @@ class RealtimePageSyncTransport implements PageSyncTransport {
 class PageSyncService {
   static const _maxClockSkew = Duration(seconds: 5);
 
+  /// How long a failure stays on screen before the bar returns to idle.
+  ///
+  /// Every failure here is transient by construction: the protocol always
+  /// lands back on [SyncStatus.idle], so a message that never clears reads as
+  /// a permanently stuck reader even though page turns still work.
+  static const defaultErrorAutoClearDelay = Duration(seconds: 6);
+
   final PageSyncTransport _transport;
   final String _currentUserId;
   final String _currentNickname;
@@ -59,6 +66,7 @@ class PageSyncService {
   final Set<String> _expectedParticipantUserIds;
   final Uuid _uuid;
   final Duration _requestTimeout;
+  final Duration _errorAutoClearDelay;
 
   final _stateController = StreamController<PageSyncState>.broadcast();
   final List<StreamSubscription<Map<String, dynamic>>> _subscriptions = [];
@@ -74,6 +82,7 @@ class PageSyncService {
   final Set<String> _explicitlyLeftParticipantUserIds = {};
 
   Timer? _timeoutTimer;
+  Timer? _errorAutoClearTimer;
   PageSyncState _state = const PageSyncState.idle();
   bool _initialized = false;
   bool _disposed = false;
@@ -96,6 +105,7 @@ class PageSyncService {
     required Set<String> expectedParticipantUserIds,
     Uuid uuid = const Uuid(),
     Duration requestTimeout = const Duration(seconds: 30),
+    Duration errorAutoClearDelay = defaultErrorAutoClearDelay,
   }) : _transport = transport,
        _currentUserId = currentUserId,
        _currentNickname = currentNickname,
@@ -107,7 +117,8 @@ class PageSyncService {
        _expectedParticipantUserIds = Set.of(expectedParticipantUserIds)
          ..add(currentUserId),
        _uuid = uuid,
-       _requestTimeout = requestTimeout;
+       _requestTimeout = requestTimeout,
+       _errorAutoClearDelay = errorAutoClearDelay;
 
   Stream<PageSyncState> get stateStream => _stateController.stream;
   PageSyncState get currentState => _state;
@@ -757,7 +768,7 @@ class PageSyncService {
 
     _cancelTimeout();
     final reason = payload['reason'] as String? ?? 'cancelled';
-    _failRequest(current, 'Page turn cancelled: $reason');
+    _failRequest(current, describeCancelReason(reason));
   }
 
   void _onPresenceChange(Map<String, dynamic> event) {
@@ -770,7 +781,7 @@ class PageSyncService {
 
     final current = _state.currentRequest;
     final onlineUsers = _transport.getOnlineUsers();
-    _recordEnteredReaders(onlineUsers);
+    _syncParticipantRoster(onlineUsers);
     if (eventType == 'leave') {
       final departedReaders = _enteredReaderParticipantIds.where((userId) {
         return !_isReadingParticipantOnline(userId, onlineUsers);
@@ -778,6 +789,16 @@ class PageSyncService {
       _enteredReaderParticipantIds.removeAll(departedReaders);
       _expectedParticipantUserIds.removeAll(departedReaders);
     }
+    // A participant who never opened the reader was previously unremovable: it
+    // stayed in the quorum even after disconnecting from the room entirely,
+    // which blocked every later page turn for everyone else. Presence absence
+    // is observed identically by all clients, so pruning on it keeps the
+    // rosters convergent. Re-entry is restored by _syncParticipantRoster.
+    _expectedParticipantUserIds.removeAll(
+      _expectedParticipantUserIds.where((userId) {
+        return userId != _currentUserId && !_isInRoom(userId, onlineUsers);
+      }).toSet(),
+    );
     if (current == null) return;
     final isExecuting = _handledExecuteIds.contains(current.requestId);
     final remainingRequired = current.requiredUserIds.where((userId) {
@@ -887,7 +908,7 @@ class PageSyncService {
       return;
     }
     if (_state.currentRequest?.requestId == request.requestId) {
-      _failRequest(request, 'Page turn cancelled: $reason');
+      _failRequest(request, describeCancelReason(reason));
     }
   }
 
@@ -928,13 +949,13 @@ class PageSyncService {
       );
     }
 
-    _recordEnteredReaders(users);
+    _syncParticipantRoster(users);
     final usersById = {
       for (final user in users)
         if (user['user_id'] is String) user['user_id'] as String: user,
     };
     final readyUserIds = <String>{};
-    var hasUnreadyReader = false;
+    final unreadyUserIds = <String>[];
     for (final userId in _expectedParticipantUserIds) {
       final user = usersById[userId];
       final isReady = user != null &&
@@ -946,13 +967,13 @@ class PageSyncService {
       } else {
         // The participant roster is frozen by the start-reading event. A
         // slower client stays pending even while it still reports lobby state.
-        hasUnreadyReader = true;
+        unreadyUserIds.add(userId);
       }
     }
 
-    if (hasUnreadyReader) {
-      return const _ReadyReaderQuorum.error(
-        'Waiting for every reader to become ready',
+    if (unreadyUserIds.isNotEmpty) {
+      return _ReadyReaderQuorum.error(
+        _unreadyReaderMessage(unreadyUserIds, usersById),
       );
     }
     if (!readyUserIds.contains(_currentUserId)) {
@@ -963,19 +984,57 @@ class PageSyncService {
     return _ReadyReaderQuorum(readyUserIds);
   }
 
-  void _recordEnteredReaders(List<Map<String, dynamic>> users) {
+  /// Names the readers still holding up the quorum.
+  ///
+  /// "Waiting for every reader to become ready" gives the user nothing to act
+  /// on when one participant is stuck in the lobby; naming them does.
+  String _unreadyReaderMessage(
+    List<String> unreadyUserIds,
+    Map<String, Map<String, dynamic>> usersById,
+  ) {
+    if (unreadyUserIds.length == 1 &&
+        unreadyUserIds.single == _currentUserId) {
+      return 'Waiting for this reader to become ready';
+    }
+    final names = unreadyUserIds
+        .where((userId) => userId != _currentUserId)
+        .map((userId) {
+          final nickname = usersById[userId]?['nickname'];
+          return nickname is String && nickname.trim().isNotEmpty
+              ? nickname.trim()
+              : null;
+        })
+        .whereType<String>()
+        .toList()
+      ..sort();
+    if (names.isEmpty || names.length != unreadyUserIds.length) {
+      return 'Waiting for every reader to become ready';
+    }
+    return 'Waiting for ${names.join(', ')} to become ready';
+  }
+
+  /// Restores every session participant that is present on the room channel.
+  ///
+  /// Absence is the only thing that removes a participant from the quorum, so
+  /// presence has to put them back — otherwise a temporary disconnect would
+  /// shrink the roster permanently and clients would disagree about the quorum
+  /// for every later page turn in the session.
+  ///
+  /// Being on the channel is enough; the participant does not have to be in
+  /// the reader. A participant waiting in the lobby blocks turns whether or
+  /// not their connection happened to blip, which is the same rule applied to
+  /// one that never disconnected at all.
+  void _syncParticipantRoster(List<Map<String, dynamic>> users) {
     for (final user in users) {
       final userId = user['user_id'];
-      if (userId is String &&
-          _sessionParticipantUserIds.contains(userId) &&
-          !_explicitlyLeftParticipantUserIds.contains(userId) &&
-          user['is_reading'] == true) {
+      if (userId is! String ||
+          !_sessionParticipantUserIds.contains(userId) ||
+          _explicitlyLeftParticipantUserIds.contains(userId)) {
+        continue;
+      }
+      _expectedParticipantUserIds.add(userId);
+      if (user['is_reading'] == true) {
         _enteredReaderParticipantIds.add(userId);
-        // A temporary Presence disconnect removes an entered reader from the
-        // active roster so the in-flight turn can finish. Re-add that reader
-        // after reconnection; otherwise clients permanently disagree about the
-        // quorum for every later page turn in the same reading session.
-        _expectedParticipantUserIds.add(userId);
       }
     }
   }
@@ -995,6 +1054,11 @@ class PageSyncService {
     return users.any(
       (user) => user['user_id'] == userId && user['is_reading'] == true,
     );
+  }
+
+  /// Present on the room channel at all, whether reading or still in the lobby.
+  bool _isInRoom(String userId, List<Map<String, dynamic>> users) {
+    return users.any((user) => user['user_id'] == userId);
   }
 
   bool _isRequestQuorumStillReady(PageTurnRequest request) {
@@ -1070,12 +1134,34 @@ class PageSyncService {
     if (!_stateController.isClosed) {
       _stateController.add(newState);
     }
+    _scheduleErrorAutoClear(newState);
+  }
+
+  /// Returns a failed state to idle so the status bar stops reporting a
+  /// finished failure as if the reader were still blocked on it.
+  void _scheduleErrorAutoClear(PageSyncState newState) {
+    _errorAutoClearTimer?.cancel();
+    _errorAutoClearTimer = null;
+    if (newState.errorMessage == null || newState.currentRequest != null) {
+      return;
+    }
+    _errorAutoClearTimer = Timer(_errorAutoClearDelay, () {
+      _errorAutoClearTimer = null;
+      if (_disposed ||
+          !identical(_state, newState) ||
+          _state.currentRequest != null) {
+        return;
+      }
+      _updateState(const PageSyncState.idle());
+    });
   }
 
   Future<void> dispose() async {
     if (_disposed) return;
     _disposed = true;
     _cancelTimeout();
+    _errorAutoClearTimer?.cancel();
+    _errorAutoClearTimer = null;
     for (final subscription in _subscriptions) {
       await subscription.cancel();
     }
@@ -1085,6 +1171,40 @@ class PageSyncService {
     onPositionRecovery = null;
     await _stateController.close();
   }
+}
+
+/// Turns a wire cancel reason into something a reader can act on.
+///
+/// The raw codes are protocol identifiers; they were previously rendered
+/// verbatim in the status bar as e.g. "Page turn cancelled:
+/// declined_by_Bob".
+String describeCancelReason(String reason) {
+  const messages = <String, String>{
+    'timeout': 'Page turn timed out waiting for the other readers',
+    'stale_page_position': 'Page turn cancelled: your page moved',
+    'reader_became_unready': 'Page turn cancelled: this reader is still loading',
+    'required_reader_not_ready':
+        'Page turn cancelled: a reader is not ready yet',
+    'invalid_or_stale_request': 'Page turn cancelled: readers were out of sync',
+    'requester_left': 'Page turn cancelled: the requester left',
+    'requester_left_reading_session':
+        'Page turn cancelled: the requester left the book',
+    'reading_session_ended': 'Page turn cancelled: the reading session ended',
+    'persistence_coordination_failed':
+        'Page turn cancelled: could not save the new page',
+  };
+
+  final known = messages[reason];
+  if (known != null) return known;
+
+  const declinePrefix = 'declined_by_';
+  if (reason.startsWith(declinePrefix)) {
+    final nickname = reason.substring(declinePrefix.length).trim();
+    return nickname.isEmpty
+        ? 'A reader asked to wait on this page'
+        : '$nickname asked to wait on this page';
+  }
+  return 'Page turn cancelled';
 }
 
 class _ReadyReaderQuorum {

@@ -4,6 +4,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../services/realtime_service.dart';
 
+export '../services/presence_merge.dart' show mergePresenceUsers;
+
 final realtimeServiceProvider = Provider<RealtimeService>((ref) {
   final service = RealtimeService();
   ref.onDispose(service.dispose);
@@ -54,51 +56,6 @@ class PresenceState {
   }
 }
 
-/// Collapses multiple device/connection metas into one logical room member.
-/// Boolean readiness is true when any live session reports it; display data is
-/// taken from the most recently tracked session.
-List<Map<String, dynamic>> mergePresenceUsers(
-  Iterable<Map<String, dynamic>> presenceUsers,
-) {
-  final grouped = <String, List<Map<String, dynamic>>>{};
-  for (final user in presenceUsers) {
-    final userId = user['user_id'];
-    if (userId is! String || userId.isEmpty) continue;
-    grouped.putIfAbsent(userId, () => []).add(user);
-  }
-
-  final merged = <Map<String, dynamic>>[];
-  for (final entry in grouped.entries) {
-    final metas = entry.value;
-    metas.sort((a, b) => _presenceTime(b).compareTo(_presenceTime(a)));
-    final latest = Map<String, dynamic>.from(metas.first);
-    latest['user_id'] = entry.key;
-    latest['has_book'] = metas.any((meta) => meta['has_book'] == true);
-    latest['ready_book_hashes'] = metas
-        .where((meta) => meta['has_book'] == true)
-        .map((meta) => meta['book_hash'])
-        .whereType<String>()
-        .toSet()
-        .toList(growable: false);
-    latest['is_reading'] = metas.any((meta) => meta['is_reading'] == true);
-    latest['reader_ready'] = metas.any((meta) => meta['reader_ready'] == true);
-    latest['session_count'] = metas.length;
-    merged.add(latest);
-  }
-
-  merged.sort((a, b) {
-    final timeOrder = _presenceTime(a).compareTo(_presenceTime(b));
-    if (timeOrder != 0) return timeOrder;
-    return (a['user_id'] as String).compareTo(b['user_id'] as String);
-  });
-  return List.unmodifiable(merged);
-}
-
-DateTime _presenceTime(Map<String, dynamic> presence) {
-  return DateTime.tryParse(presence['online_at'] as String? ?? '') ??
-      DateTime.fromMillisecondsSinceEpoch(0, isUtc: true);
-}
-
 class PresenceNotifier extends StateNotifier<PresenceState> {
   final RealtimeService _realtimeService;
   StreamSubscription<Map<String, dynamic>>? _presenceSubscription;
@@ -114,10 +71,19 @@ class PresenceNotifier extends StateNotifier<PresenceState> {
   bool _currentIsReading = false;
   bool _currentReaderReady = false;
   bool _isAppActive = true;
+  bool _hasPendingJoinAnnouncement = false;
+  Timer? _joinAnnouncementRetryTimer;
 
-  PresenceNotifier(this._realtimeService) : super(const PresenceState()) {
+  /// Gap between retries of a queued join announcement whose send failed.
+  final Duration joinAnnouncementRetryDelay;
+
+  PresenceNotifier(
+    this._realtimeService, {
+    this.joinAnnouncementRetryDelay = const Duration(seconds: 3),
+  }) : super(const PresenceState()) {
     _presenceSubscription = _realtimeService.presenceStream.listen((event) {
-      final users = mergePresenceUsers(_realtimeService.getOnlineUsers());
+      // Already merged to one row per logical user by RealtimeService.
+      final users = _realtimeService.getOnlineUsers();
       state = state.copyWith(
         onlineUsers: users,
         hasInitialSync: state.hasInitialSync || event['event'] == 'sync',
@@ -133,6 +99,9 @@ class PresenceNotifier extends StateNotifier<PresenceState> {
         hasInitialSync: hasUsablePresence && state.hasInitialSync,
         error: event.error?.toString(),
       );
+      if (event.status == RealtimeConnectionStatus.connected) {
+        unawaited(_flushJoinAnnouncement());
+      }
     });
   }
 
@@ -222,6 +191,48 @@ class PresenceNotifier extends StateNotifier<PresenceState> {
   /// authorization is evaluated against room membership, so this must happen
   /// before the leave RPC/delete removes that membership.
   Future<void> announceLeaving() async {
+    await _announceMembership('leaving');
+  }
+
+  /// Presence alone does not tell existing members that the database roster
+  /// grew: it only says a connection appeared. Announcing the join makes every
+  /// other client re-read the authoritative member list instead of waiting for
+  /// an unrelated refresh.
+  ///
+  /// [RealtimeService.joinRoom] returns once `subscribe()` has been *called*,
+  /// not once the channel is subscribed, so the transport is still connecting
+  /// here and sending immediately dropped every join silently.
+  ///
+  /// The announcement is therefore queued rather than raced against a timer:
+  /// it is sent on the next connected event and stays queued until it lands or
+  /// the room session is replaced. A slow subscription must not lose it — in
+  /// the same-user rejoin this exists for, lingering metas merge to the same
+  /// user ID, so the lobby's Presence-ID listener sees no change and this is
+  /// the only signal the peers get that the roster grew.
+  Future<void> announceJoining() async {
+    _hasPendingJoinAnnouncement = true;
+    await _flushJoinAnnouncement();
+  }
+
+  Future<void> _flushJoinAnnouncement() async {
+    _joinAnnouncementRetryTimer?.cancel();
+    _joinAnnouncementRetryTimer = null;
+    if (!_hasPendingJoinAnnouncement || !_realtimeService.isConnected) return;
+    _hasPendingJoinAnnouncement = false;
+    try {
+      await _announceMembership('joined');
+    } catch (_) {
+      // A send can fail while the channel stays 'connected', so waiting for
+      // another connection event would strand the join indefinitely.
+      _hasPendingJoinAnnouncement = true;
+      _joinAnnouncementRetryTimer = Timer(joinAnnouncementRetryDelay, () {
+        _joinAnnouncementRetryTimer = null;
+        unawaited(_flushJoinAnnouncement());
+      });
+    }
+  }
+
+  Future<void> _announceMembership(String action) async {
     final roomCode = _currentRoomCode;
     final userId = _currentUserId;
     if (roomCode == null || userId == null || !_realtimeService.isConnected) {
@@ -229,7 +240,7 @@ class PresenceNotifier extends StateNotifier<PresenceState> {
     }
     await _realtimeService.broadcast(
       event: 'membership_changed',
-      payload: {'action': 'leaving', 'room_code': roomCode, 'user_id': userId},
+      payload: {'action': action, 'room_code': roomCode, 'user_id': userId},
     );
   }
 
@@ -257,6 +268,10 @@ class PresenceNotifier extends StateNotifier<PresenceState> {
   }
 
   void _clearCurrentUser() {
+    // A queued announcement belongs to the room session that queued it.
+    _hasPendingJoinAnnouncement = false;
+    _joinAnnouncementRetryTimer?.cancel();
+    _joinAnnouncementRetryTimer = null;
     _currentRoomCode = null;
     _currentRoomTopicId = null;
     _currentUserId = null;
@@ -276,6 +291,8 @@ class PresenceNotifier extends StateNotifier<PresenceState> {
 
   @override
   void dispose() {
+    _joinAnnouncementRetryTimer?.cancel();
+    _joinAnnouncementRetryTimer = null;
     _presenceSubscription?.cancel();
     _connectionSubscription?.cancel();
     super.dispose();
